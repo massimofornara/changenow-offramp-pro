@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: changenow-offramp-pro
+    env: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r services/api/requirements.txt
+    startCommand: uvicorn services.api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: DATABASE_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: CHANGENOW_BASE_URL
+        value: https://api.changenow.io/v2
+      - key: CHANGENOW_API_KEY
+        sync: false
+      - key: CHANGENOW_REF_ID
+        sync: false
+      - key: CHANGENOW_PUBLIC_SELL_URL
+        value: https://changenow.io/sell
+      - key: NOWPAYMENTS_BASE_URL
+        value: https://api.nowpayments.io/v1
+      - key: NOWPAYMENTS_API_KEY
+        sync: false
+      - key: NOWPAYMENTS_IPN_SECRET
+        sync: false
+      - key: REFERRER_DOMAIN
+        value: neonoble.eu
+      - key: WEBHOOK_BASE
+        value: https://changenow-offramp-pro.onrender.com
