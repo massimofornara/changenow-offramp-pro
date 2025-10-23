@@ -1,9 +1,14 @@
+# in cima al file
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # usato solo dai type-checkers / IDE, non a runtime
+    from services.api.schemas import Offramp  # o il tipo corretto che hai in schemas.py
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from services.api.db import get_db
-from services.api.models import OfframpOrder, OtcListing
 from services.api.services.nowpayments import NowPaymentsClient, NowPaymentsError
 
 router = APIRouter(prefix="/offramp", tags=["offramp"])
