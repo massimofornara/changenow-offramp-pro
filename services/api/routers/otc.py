@@ -20,6 +20,7 @@ def get_listings(db = Depends(get_db)):
     for r in res:
         row = dict(r)
         if row.get("updated_at"):
+            # cast a stringa ISO per evitare 500
             row["updated_at"] = row["updated_at"].isoformat()
         out.append(OTCListing(**row))
     return out

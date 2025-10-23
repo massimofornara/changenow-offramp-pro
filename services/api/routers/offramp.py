@@ -107,45 +107,60 @@ async def nowpayments_webhook(request: Request, body: NPWebhook, db = Depends(ge
     raw = await request.body()
     sig = request.headers.get("x-nowpayments-sig") or body.signature or ""
     if not verify_hmac_sha256(raw, sig, settings.NOWPAYMENTS_IPN_SECRET):
-        logger.warning("Invalid NOWPayments webhook signature")
         raise HTTPException(401, "Invalid signature")
 
-    logger.info(f"NOWPayments webhook: {body.model_dump()}")
-
-    payout_id = body.payout_id or body.payment_id or body.order_id
-    payout_status = (body.payout_status or body.payment_status or "").lower()
+    payout_id = body.payout_id or body.payment_id or body.order_id or ""
+    status = (body.payout_status or body.payment_status or "").lower()
 
     if not payout_id:
-        return {"ok": True}
+        return {"ok": True}  # niente da fare
 
-    # Find order by stored nowpayments_payout_id
+    # collega via payout_id; se non trovato, prova via reference=order_id
     row = db.execute(select(orders).where(orders.c.nowpayments_payout_id == payout_id)).mappings().first()
     if not row:
-        logger.warning(f"Payout {payout_id} not linked to any order")
-        return {"ok": True}
+        try_ref = db.execute(select(orders).where(orders.c.id == payout_id)).mappings().first()
+        row = try_ref or row
+
+    if not row:
+        return {"ok": True, "note": "payout non collegato ad alcun ordine"}
 
     new_status = row["status"]
-    if payout_status in ("finished", "confirmed", "success", "completed"):
+    if status in ("finished", "confirmed", "success", "completed"):
         new_status = "completed"
-    elif payout_status in ("failed", "rejected", "chargeback"):
+    elif status in ("failed", "rejected", "chargeback"):
         new_status = "failed"
     else:
         new_status = "payout_pending"
 
-    db.execute(update(orders).where(orders.c.id == row["id"]).values(status=new_status))
+    db.execute(update(orders)
+               .where(orders.c.id == row["id"])
+               .values(status=new_status))
     db.commit()
     return {"ok": True, "order_id": str(row["id"]), "status": new_status}
-
+   
 @router.post("/trigger-payout/{order_id}")
-def trigger_payout(order_id: str, db: Session = Depends(get_db)):
-    order = db.query(OfframpOrder).filter_by(order_id=order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+async def trigger_payout(order_id: str, db = Depends(get_db)):
+    row = db.execute(select(orders).where(orders.c.id == order_id)).mappings().first()
+    if not row:
+        raise HTTPException(404, "Order not found")
+    if not row["iban"] or not row["beneficiary_name"]:
+        raise HTTPException(400, "IBAN/beneficiary_name mancanti")
+    if row["status"] not in ("quoted", "processing", "payout_pending"):
+        raise HTTPException(400, f"Stato non valido per payout: {row['status']}")
 
-    # simula chiamata reale a NOWPayments (solo demo)
-    payout_id = f"np_{order_id[:8]}"
-    order.status = "payout_pending"
-    order.nowpayments_payout_id = payout_id
+    np = NowPaymentsClient()
+    payout = await np.create_payout(
+        amount_eur=row["amount_eur"],
+        iban=row["iban"],
+        beneficiary_name=row["beneficiary_name"],
+        reference=str(order_id)
+    )
+    payout_id = str(payout.get("payout_id") or payout.get("id") or payout.get("payment_id") or "")
+    if not payout_id:
+        raise HTTPException(502, f"Payout creation response unexpected: {payout}")
+
+    db.execute(update(orders)
+               .where(orders.c.id == row["id"])
+               .values(status="payout_pending", nowpayments_payout_id=payout_id))
     db.commit()
-
-    return {"ok": True, "order_id": order_id, "payout_id": payout_id, "status": order.status}
+    return {"ok": True, "order_id": order_id, "payout_id": payout_id, "status": "payout_pending"}
