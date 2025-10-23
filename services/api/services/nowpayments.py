@@ -1,49 +1,131 @@
 # services/api/services/nowpayments.py
-import aiohttp
-from services.api.config import settings
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Dict, Optional
+
+import httpx
+
+
+class NowPaymentsError(RuntimeError):
+    """Errore proveniente da NOWPayments (HTTP >= 400)."""
+    def __init__(self, status: int, body: Any):
+        super().__init__(f"NOWPayments {status}: {body}")
+        self.status = status
+        self.body = body
+
 
 class NowPaymentsClient:
     """
-    Client minimale per NOWPayments payout. Usa /v1/payout come primaria
-    e fallback su /v1/payouts (alcuni account/ambienti differiscono).
+    Client minimale NOWPayments per payout bancari in EUR.
+    - Usa 'x-api-key' da env NOWPAYMENTS_API_KEY
+    - Base URL da env NOWPAYMENTS_BASE_URL (default: https://api.nowpayments.io/v1)
+    - Prova /payout poi /payouts (fallback)
+    - Supporta campi extra via env NOWPAYMENTS_BANK_EXTRA_JSON (JSON string)
+      es: {"bank_swift":"DEUTDEFFXXX","bank_country":"DE","beneficiary_address":"..."}
     """
-    def __init__(self):
-        if not settings.NOWPAYMENTS_API_KEY:
-            raise RuntimeError("NOWPAYMENTS_API_KEY missing")
-        self.base_url = settings.NOWPAYMENTS_BASE_URL.rstrip("/")
-        self.headers = {
-            "x-api-key": settings.NOWPAYMENTS_API_KEY,
+
+    def __init__(self) -> None:
+        self.api_key = os.getenv("NOWPAYMENTS_API_KEY", "")
+        if not self.api_key:
+            raise RuntimeError("NOWPAYMENTS_API_KEY non configurata")
+
+        self.base_url = os.getenv("NOWPAYMENTS_BASE_URL", "https://api.nowpayments.io/v1").rstrip("/")
+        self.timeout = float(os.getenv("NOWPAYMENTS_TIMEOUT", "30"))
+        self._bank_extra_json = os.getenv("NOWPAYMENTS_BANK_EXTRA_JSON", "").strip()
+
+        headers = {
+            "x-api-key": self.api_key,
             "Content-Type": "application/json",
         }
+        self._client = httpx.Client(base_url=self.base_url, headers=headers, timeout=self.timeout)
 
-    async def _post_json(self, url: str, payload: dict) -> dict:
-        async with aiohttp.ClientSession(headers=self.headers) as s:
-            async with s.post(url, json=payload) as r:
-                data = await r.json(content_type=None)
-                if r.status >= 400:
-                    raise RuntimeError(f"NOWPayments {r.status}: {data}")
-                return data
+    def _close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            pass
 
-    async def create_payout(
-        self, *, amount_eur: float, iban: str, beneficiary_name: str, reference: str
-    ) -> dict:
+    def __del__(self) -> None:
+        self._close()
+
+    # ------- Helpers -------
+    def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        r = self._client.post(path, json=payload)
+        # Alcune risposte possono non avere content-type json corretto
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text}
+
+        if r.status_code >= 400:
+            raise NowPaymentsError(r.status_code, data)
+        return data
+
+    def _build_withdrawal(
+        self,
+        *,
+        amount_eur: float,
+        iban: str,
+        beneficiary_name: str,
+        reference: str,
+    ) -> Dict[str, Any]:
         """
-        Crea payout EUR (SEPA). Alcuni account richiedono campi addizionali
-        (es. titolare, SWIFT/BIC). Se ottieni 4xx, arricchisci il payload.
+        Struttura withdrawal generica. Alcuni account richiedono campi extra:
+        - bank_swift / bank_country / bank_name / beneficiary_address / bank_address
+        - puoi passarli via NOWPAYMENTS_BANK_EXTRA_JSON (stringa JSON).
         """
-        payload = {
-            "withdrawals": [{
-                "address": iban,              # IBAN
-                "amount": amount_eur,         # EUR
-                "currency": "eur",            # valuta fiat
-                "extra_id": beneficiary_name, # alias/memo
-                "custom_id": reference        # referenza nostro ordine
-            }]
+        wd: Dict[str, Any] = {
+            "amount": float(amount_eur),
+            "currency": "eur",
+            "address": iban,                # IBAN
+            "extra_id": beneficiary_name,   # usato come memo/beneficiario
+            "custom_id": reference,         # collega all'order_id
         }
 
-        # Primo tentativo
+        if self._bank_extra_json:
+            try:
+                extra = json.loads(self._bank_extra_json)
+                if isinstance(extra, dict):
+                    wd.update(extra)        # merge campi extra
+            except Exception:
+                # ignora JSON malformato
+                pass
+
+        return wd
+
+    # ------- API -------
+
+    def create_bank_payout(
+        self,
+        *,
+        amount_eur: float,
+        iban: str,
+        beneficiary_name: str,
+        reference: str,
+    ) -> Dict[str, Any]:
+        """
+        Crea payout EUR su NOWPayments.
+        Ritorna il dict della risposta provider.
+        Solleva NowPaymentsError su HTTP >= 400.
+        """
+        withdrawal = self._build_withdrawal(
+            amount_eur=amount_eur,
+            iban=iban,
+            beneficiary_name=beneficiary_name,
+            reference=reference,
+        )
+
+        # Formato 1: /v1/payout accetta {"withdrawals":[{...}]}
+        payload_v1 = {"withdrawals": [withdrawal]}
+
+        # 1) prova /payout
         try:
-            return await self._post_json(f"{self.base_url}/payout", payload)
-        except Exception:
-            # Fallback su /payouts
-            return await self._post_json(f"{self.base_url}/payouts", payload)
+            return self._post_json("/payout", payload_v1)
+        except NowPaymentsError as e:
+            # Se 404/405/422, potrebbe essere endpoint diverso: tenta /payouts
+            if e.status in (404, 405, 422):
+                # Alcuni ambienti accettano lo stesso payload anche su /payouts
+                return self._post_json("/payouts", payload_v1)
+            raise
