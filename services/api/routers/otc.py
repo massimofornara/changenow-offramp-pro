@@ -16,8 +16,13 @@ def get_db():
 @router.get("/listings", response_model=list[OTCListing])
 def get_listings(db = Depends(get_db)):
     res = db.execute(select(otc_listings)).mappings().all()
-    return [OTCListing(**dict(r)) for r in res]
-
+    out = []
+    for r in res:
+        row = dict(r)
+        if row.get("updated_at"):
+            row["updated_at"] = row["updated_at"].isoformat()
+        out.append(OTCListing(**row))
+    return out
 @router.post("/set-price")
 def set_price(body: SetPriceRequest, db = Depends(get_db)):
     token = body.token_symbol.upper()
