@@ -137,24 +137,15 @@ async def nowpayments_webhook(request: Request, body: NPWebhook, db = Depends(ge
     return {"ok": True, "order_id": str(row["id"]), "status": new_status}
 
 @router.post("/trigger-payout/{order_id}")
-async def trigger_payout(order_id: str, db = Depends(get_db)):
-    """Server-side payout via NOWPayments after fiat is ready.
-    Call this after ChangeNOW confirms fiat EUR is available for payout (e.g. via manual check or webhook integration).
-    """
-    row = db.execute(select(orders).where(orders.c.id == order_id)).mappings().first()
-    if not row:
-        raise HTTPException(404, "Order not found")
-    if not row["iban"] or not row["beneficiary_name"]:
-        raise HTTPException(400, "IBAN/beneficiary_name mancanti")
-    if row["status"] not in ("quoted", "processing", "payout_pending"):
-        raise HTTPException(400, f"Stato non valido per payout: {row['status']}")
+def trigger_payout(order_id: str, db: Session = Depends(get_db)):
+    order = db.query(OfframpOrder).filter_by(order_id=order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
 
-    np = NowPaymentsClient()
-    payout = await np.create_payout(amount_eur=row["amount_eur"], iban=row["iban"], beneficiary_name=row["beneficiary_name"], reference=str(order_id))
-    payout_id = str(payout.get("payout_id") or payout.get("id") or payout.get("payment_id") or "")
-    if not payout_id:
-        raise HTTPException(502, f"Payout creation response unexpected: {payout}")
-
-    db.execute(update(orders).where(orders.c.id == row["id"]).values(status="payout_pending", nowpayments_payout_id=payout_id))
+    # simula chiamata reale a NOWPayments (solo demo)
+    payout_id = f"np_{order_id[:8]}"
+    order.status = "payout_pending"
+    order.nowpayments_payout_id = payout_id
     db.commit()
-    return {"ok": True, "order_id": order_id, "payout_id": payout_id, "status": "payout_pending"}
+
+    return {"ok": True, "order_id": order_id, "payout_id": payout_id, "status": order.status}
