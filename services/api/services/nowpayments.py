@@ -1,6 +1,6 @@
 import httpx
 from typing import Any, Dict, Optional
-from config import settings
+from services.api.config import settings
 
 class NowPaymentsClient:
     def __init__(self):
