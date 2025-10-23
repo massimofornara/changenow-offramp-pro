@@ -1,16 +1,18 @@
+# in cima al file
+from services.api.db import metadata, engine
+metadata.create_all(engine)
+# services/api/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from services.api.config import settings
+from services.api.routers.offramp import router as offramp_router
+from services.api.routers.otc import router as otc_router
+from services.api.routers.changenow import router as changenow_router
 
-# ... istanzia FastAPI prima
+app = FastAPI(title="changenow-offramp-pro")
 
-from .db import init_db
-from .routers.otc import router as otc_router
-from .routers.offramp import router as offramp_router
-from .routers.changenow_widget import router as cn_widget_router
-
-app = FastAPI(title="ChangeNOW Offramp PRO (with NOWPayments)", version="1.0.0")
-
+# CORS config
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -19,14 +21,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-def on_startup():
-    init_db()
-
-app.include_router(otc_router)
-app.include_router(offramp_router)
-app.include_router(cn_widget_router)
-
 @app.get("/")
-def root():
-    return {"ok": True, "service": "changenow-offramp-pro", "env": settings.ENV}
+def health():
+    return {"ok": True, "service": "changenow-offramp-pro", "env": "production"}
+
+# Routers
+app.include_router(otc_router)
+app.include_router(changenow_router)
+app.include_router(offramp_router)
