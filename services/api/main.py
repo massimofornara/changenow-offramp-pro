@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .config import settings
+from services.api.config import settings
+
+# ... istanzia FastAPI prima
+
 from .db import init_db
 from .routers.otc import router as otc_router
 from .routers.offramp import router as offramp_router
