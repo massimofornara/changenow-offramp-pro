@@ -1,4 +1,5 @@
 # services/api/main.py
+import uuid  
 import os
 import requests
 from fastapi import FastAPI, HTTPException, Body
@@ -164,15 +165,16 @@ def wise_create_transfer(quote_id: str, recipient_id: int, amount_eur: float, no
     payload = {
         "targetAccount": recipient_id,
         "quoteUuid": quote_id,
-        "customerTransactionId": f"tx-{recipient_id}-{int(amount_eur * 100)}",
+        # ✅ Wise richiede UUID per customerTransactionId (idempotency)
+        "customerTransactionId": str(uuid.uuid4()),
         "details": {
-            "reference": note[:35],  # riferimento corto accettato da molti istituti
+            # ✅ massima lunghezza 35 caratteri per molti rails
+            "reference": note[:35],
             "transferPurpose": "verification.transfers.payout",
             "sourceOfFunds": "other",
         },
     }
     return _post_json(url, payload)
-
 def wise_fund_transfer(transfer_id: int) -> dict:
     url = f"{wise_base_url()}/transfers/{transfer_id}/payments"
     payload = {"type": "BALANCE"}
