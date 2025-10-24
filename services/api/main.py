@@ -78,4 +78,5 @@ def nowpayments_health():
         for u in urls:
             try:
                 r = requests.get(u, headers=h, timeout=10)
-                if r.status_code in (200, 204
+                if r.status_code in (200, 204):
+    return {"ok": True, "status_code": r.status_code, "checked": u, "auth_mode": "api_key" if not NP_USE_JWT else "jwt"}
