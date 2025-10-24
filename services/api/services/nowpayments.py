@@ -1,59 +1,71 @@
 # services/api/services/nowpayments.py
 from __future__ import annotations
 
-import json
 import os
-from typing import Any, Dict, Optional
-
+import time
 import httpx
-
+from typing import Any, Dict
 
 class NowPaymentsError(RuntimeError):
-    """Errore proveniente da NOWPayments (HTTP >= 400)."""
     def __init__(self, status: int, body: Any):
         super().__init__(f"NOWPayments {status}: {body}")
         self.status = status
         self.body = body
 
-
 class NowPaymentsClient:
     """
-    Client minimale NOWPayments per payout bancari in EUR.
-    - Usa 'x-api-key' da env NOWPAYMENTS_API_KEY
-    - Base URL da env NOWPAYMENTS_BASE_URL (default: https://api.nowpayments.io/v1)
-    - Prova /payout poi /payouts (fallback)
-    - Supporta campi extra via env NOWPAYMENTS_BANK_EXTRA_JSON (JSON string)
-      es: {"bank_swift":"DEUTDEFFXXX","bank_country":"DE","beneficiary_address":"..."}
+    Client per payout bancari/mass payouts:
+    - /v1/auth -> JWT (scade ~5 minuti)
+    - /v1/payout (o /v1/payouts) -> richiede Authorization: Bearer <JWT>
+    - x-api-key NON basta per payout.
     """
-
     def __init__(self) -> None:
-        self.api_key = os.getenv("NOWPAYMENTS_API_KEY", "")
-        if not self.api_key:
-            raise RuntimeError("NOWPAYMENTS_API_KEY non configurata")
-
         self.base_url = os.getenv("NOWPAYMENTS_BASE_URL", "https://api.nowpayments.io/v1").rstrip("/")
+        self.api_key   = os.getenv("NOWPAYMENTS_API_KEY", "")  # può servire per altre chiamate
+        self.email     = os.getenv("NOWPAY_EMAIL", "")
+        self.password  = os.getenv("NOWPAY_PASSWORD", "")
+        if not self.email or not self.password:
+            raise RuntimeError("NOWPAY_EMAIL / NOWPAY_PASSWORD non configurati")
+
         self.timeout = float(os.getenv("NOWPAYMENTS_TIMEOUT", "30"))
-        self._bank_extra_json = os.getenv("NOWPAYMENTS_BANK_EXTRA_JSON", "").strip()
+        self._jwt: str = ""
+        self._jwt_exp: float = 0.0
 
-        headers = {
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json",
-        }
-        self._client = httpx.Client(base_url=self.base_url, headers=headers, timeout=self.timeout)
+        self._client = httpx.Client(timeout=self.timeout)
 
-    def _close(self) -> None:
+    # ----------------- auth -----------------
+    def _auth(self) -> None:
+        """Ottiene un nuovo JWT e imposta la scadenza locale (5 minuti)."""
+        url = f"{self.base_url}/auth"
+        payload = {"email": self.email, "password": self.password}
+        r = self._client.post(url, json=payload)
         try:
-            self._client.close()
+            data = r.json()
         except Exception:
-            pass
+            raise NowPaymentsError(r.status_code, r.text)
 
-    def __del__(self) -> None:
-        self._close()
+        if r.status_code >= 400 or "token" not in data:
+            raise NowPaymentsError(r.status_code, data)
 
-    # ------- Helpers -------
-    def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        r = self._client.post(path, json=payload)
-        # Alcune risposte possono non avere content-type json corretto
+        self._jwt = data["token"]
+        # il token scade in ~5 minuti: rinnovo un po’ prima (4 min)
+        self._jwt_exp = time.time() + 4 * 60
+
+    def _ensure_jwt(self) -> str:
+        if not self._jwt or time.time() >= self._jwt_exp:
+            self._auth()
+        return self._jwt
+
+    # ----------------- helpers -----------------
+    def _post_json(self, path: str, json_body: Dict[str, Any], use_bearer: bool = False) -> Dict[str, Any]:
+        headers = {"Content-Type": "application/json"}
+        if use_bearer:
+            headers["Authorization"] = f"Bearer {self._ensure_jwt()}"
+        # opzionale: alcune integrazioni usano anche x-api-key
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+
+        r = self._client.post(f"{self.base_url}{path}", json=json_body, headers=headers)
         try:
             data = r.json()
         except Exception:
@@ -63,69 +75,27 @@ class NowPaymentsClient:
             raise NowPaymentsError(r.status_code, data)
         return data
 
-    def _build_withdrawal(
-        self,
-        *,
-        amount_eur: float,
-        iban: str,
-        beneficiary_name: str,
-        reference: str,
-    ) -> Dict[str, Any]:
+    # ----------------- API payout -----------------
+    def create_bank_payout(self, *, amount_eur: float, iban: str, beneficiary_name: str, reference: str) -> Dict[str, Any]:
         """
-        Struttura withdrawal generica. Alcuni account richiedono campi extra:
-        - bank_swift / bank_country / bank_name / beneficiary_address / bank_address
-        - puoi passarli via NOWPAYMENTS_BANK_EXTRA_JSON (stringa JSON).
+        Crea un payout. Alcuni account accettano /payout, altri /payouts.
+        Necessita Authorization: Bearer <JWT>.
         """
-        wd: Dict[str, Any] = {
-            "amount": float(amount_eur),
+        withdrawal = {
             "currency": "eur",
-            "address": iban,                # IBAN
-            "extra_id": beneficiary_name,   # usato come memo/beneficiario
-            "custom_id": reference,         # collega all'order_id
+            "amount": float(amount_eur),
+            "address": iban,                       # IBAN
+            "withdrawal_description": reference,   # memo/descrizione
+            # altri campi bancari specifici del tuo profilo possono essere richiesti:
+            # "bank_swift": "...", "bank_country": "...", ecc.
         }
-
-        if self._bank_extra_json:
-            try:
-                extra = json.loads(self._bank_extra_json)
-                if isinstance(extra, dict):
-                    wd.update(extra)        # merge campi extra
-            except Exception:
-                # ignora JSON malformato
-                pass
-
-        return wd
-
-    # ------- API -------
-
-    def create_bank_payout(
-        self,
-        *,
-        amount_eur: float,
-        iban: str,
-        beneficiary_name: str,
-        reference: str,
-    ) -> Dict[str, Any]:
-        """
-        Crea payout EUR su NOWPayments.
-        Ritorna il dict della risposta provider.
-        Solleva NowPaymentsError su HTTP >= 400.
-        """
-        withdrawal = self._build_withdrawal(
-            amount_eur=amount_eur,
-            iban=iban,
-            beneficiary_name=beneficiary_name,
-            reference=reference,
-        )
-
-        # Formato 1: /v1/payout accetta {"withdrawals":[{...}]}
-        payload_v1 = {"withdrawals": [withdrawal]}
+        payload = {"payouts": [withdrawal]}
 
         # 1) prova /payout
         try:
-            return self._post_json("/payout", payload_v1)
+            return self._post_json("/payout", payload, use_bearer=True)
         except NowPaymentsError as e:
-            # Se 404/405/422, potrebbe essere endpoint diverso: tenta /payouts
+            # fallback a /payouts se non supportato
             if e.status in (404, 405, 422):
-                # Alcuni ambienti accettano lo stesso payload anche su /payouts
-                return self._post_json("/payouts", payload_v1)
+                return self._post_json("/payouts", payload, use_bearer=True)
             raise

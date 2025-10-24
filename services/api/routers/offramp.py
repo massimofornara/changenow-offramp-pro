@@ -1,21 +1,37 @@
+# services/api/routers/offramp.py
+from __future__ import annotations
+
 import os
 import sqlite3
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-# --- DB helpers (sqlite3, nessun import circolare) ----------------------------
+# ---------------------------
+# Config / DB helpers
+# ---------------------------
 DB_PATH = os.getenv("DB_PATH", "data.db")
+NOWPAYMENTS_BASE_URL = os.getenv("NOWPAYMENTS_BASE_URL", "https://api.nowpayments.io/v1").rstrip("/")
+NOWPAYMENTS_JWT = os.getenv("NOWPAYMENTS_JWT", "").strip()          # preferito: token Bearer fornito dalla dashboard/supporto
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()  # opzionale
+NOWPAYMENTS_BANK_EXTRA_JSON = os.getenv("NOWPAYMENTS_BANK_EXTRA_JSON", "").strip()  # opzionale JSON
 
 def _conn() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True) if "/" in DB_PATH else None
+    # assicurati cartella se path contiene directory
+    dirpath = os.path.dirname(DB_PATH)
+    if dirpath:
+        try:
+            os.makedirs(dirpath, exist_ok=True)
+        except Exception:
+            pass
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
-def _init():
+def _init_db() -> None:
     conn = _conn()
     cur = conn.cursor()
     cur.execute("""
@@ -35,7 +51,7 @@ def _init():
         eur_amount REAL NOT NULL,
         iban TEXT NOT NULL,
         beneficiary_name TEXT NOT NULL,
-        status TEXT NOT NULL,                 -- created | payout_pending | completed | failed
+        status TEXT NOT NULL,
         nowpayments_payout_id TEXT,
         redirect_url TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -45,14 +61,16 @@ def _init():
     conn.commit()
     conn.close()
 
-_init()
+_init_db()
 
 def _rowdict(row: sqlite3.Row) -> Dict[str, Any]:
     return {k: row[k] for k in row.keys()}
 
-# --- Schemas ------------------------------------------------------------------
+# ---------------------------
+# Schemas
+# ---------------------------
 class SetPriceIn(BaseModel):
-    token_symbol: str = Field(..., examples=["NENO"])
+    token_symbol: str = Field(..., example="NENO")
     price_eur: float = Field(..., gt=0)
     available_amount: float = Field(..., ge=0)
 
@@ -63,15 +81,16 @@ class CreateOrderIn(BaseModel):
     beneficiary_name: str
     redirect_url: Optional[str] = ""
 
-# --- Router -------------------------------------------------------------------
+# ---------------------------
+# Router
+# ---------------------------
 router = APIRouter(prefix="", tags=["offramp"])
 
 @router.get("/offramp/health")
 async def health():
     return {"ok": True, "router": "offramp"}
 
-# ============= OTC LISTINGS ===================================================
-
+# OTC endpoints (same as before)
 @router.post("/otc/set-price")
 async def set_price(body: SetPriceIn):
     conn = _conn()
@@ -89,29 +108,24 @@ async def set_price(body: SetPriceIn):
     return {"ok": True, "token": body.token_symbol.upper(), "price_eur": float(body.price_eur)}
 
 @router.get("/otc/listings")
-async def listings() -> List[Dict[str, Any]]:
+async def listings():
     conn = _conn()
     cur = conn.cursor()
     rows = cur.execute("SELECT * FROM otc_listings ORDER BY token_symbol").fetchall()
     conn.close()
     return [_rowdict(r) for r in rows]
 
-# ============= CREATE ORDER ===================================================
-
 @router.post("/offramp/create-order")
 async def create_order(body: CreateOrderIn):
-    # recupera listing
     conn = _conn()
     cur = conn.cursor()
-    row = cur.execute("SELECT price_eur, available_amount FROM otc_listings WHERE token_symbol=?",
-                      (body.token_symbol.upper(),)).fetchone()
+    row = cur.execute("SELECT price_eur, available_amount FROM otc_listings WHERE token_symbol=?", (body.token_symbol.upper(),)).fetchone()
     if not row:
         conn.close()
         raise HTTPException(404, detail="Listing non trovato")
 
     price_eur = float(row["price_eur"])
     eur_amount = price_eur * float(body.amount_tokens)
-    # NB: qui potresti anche scalare available_amount se vuoi “prenotare”
 
     cur.execute("""
         INSERT INTO sales (token_symbol, amount_tokens, price_eur, eur_amount, iban, beneficiary_name,
@@ -133,101 +147,123 @@ async def create_order(body: CreateOrderIn):
         "price_eur": price_eur,
         "token_symbol": body.token_symbol.upper(),
         "redirect_url": body.redirect_url or "",
-        # puoi generare un link di vendita ChangeNOW dal tuo altro router, qui lo lasciamo informativo
     }
 
-@router.get("/offramp/sales/{order_id}")
-async def get_sale(order_id: int):
-    conn = _conn()
-    cur = conn.cursor()
-    row = cur.execute("SELECT * FROM sales WHERE id=?", (order_id,)).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(404, detail="Ordine non trovato")
-    return _rowdict(row)
-
-# ============= TRIGGER REAL NOWPAYMENTS PAYOUT ================================
-
-NOW_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()
-NOW_BASE_URL = os.getenv("NOWPAYMENTS_BASE_URL", "https://api.nowpayments.io/v1").rstrip("/")
-
-async def _create_nowpayments_payout(*, amount_eur: float, iban: str, beneficiary: str, note: str) -> Dict[str, Any]:
+# ---------------------------
+# NOWPayments payout helper (uses JWT if provided)
+# ---------------------------
+async def _call_nowpayments_payout(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Chiamata reale a NOWPayments payout.
-    L'API esatta può variare; qui usiamo un formato comune:
-      POST /v1/payout
-      Headers: x-api-key
-      Body:
-        {
-          "payouts": [{
-            "currency": "eur",
-            "amount": <float>,
-            "address": "<IBAN>",
-            "withdrawal_description": "note"
-          }]
-        }
+    Tenta /payout e poi /payouts. Usa Authorization: Bearer <JWT> se NOWPAYMENTS_JWT è impostato.
+    In alternativa include x-api-key se presente.
     """
-    if not NOW_API_KEY:
-        raise HTTPException(500, detail="NOWPayments API key mancante (NOWPAYMENTS_API_KEY)")
+    headers = {"Content-Type": "application/json"}
+    if NOWPAYMENTS_JWT:
+        headers["Authorization"] = f"Bearer {NOWPAYMENTS_JWT}"
+    if NOWPAYMENTS_API_KEY:
+        headers["x-api-key"] = NOWPAYMENTS_API_KEY
 
-    url = f"{NOW_BASE_URL}/payout"
-    payload = {
-        "payouts": [{
-            "currency": "eur",
-            "amount": float(amount_eur),
-            "address": iban,
-            "withdrawal_description": note or f"Payout {beneficiary}"
-        }]
-    }
-    headers = {"x-api-key": NOW_API_KEY, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        # prova /payout
+        url1 = f"{NOWPAYMENTS_BASE_URL}/payout"
+        r1 = await client.post(url1, json=payload, headers=headers)
+        try:
+            data1 = r1.json()
+        except Exception:
+            data1 = {"raw": r1.text}
+        if r1.status_code in (200, 201):
+            return data1
+        # se non ok, prova fallback /payouts
+        url2 = f"{NOWPAYMENTS_BASE_URL}/payouts"
+        r2 = await client.post(url2, json=payload, headers=headers)
+        try:
+            data2 = r2.json()
+        except Exception:
+            data2 = {"raw": r2.text}
+        if r2.status_code in (200, 201):
+            return data2
+        # altrimenti solleva con info provider
+        # preferisci data2 se presente, altrimenti data1
+        raise HTTPException(status_code=502, detail={"message": "NOWPayments payout error", "response1": data1, "response2": data2, "status1": r1.status_code, "status2": r2.status_code})
 
-    async with httpx.AsyncClient(timeout=40) as client:
-        r = await client.post(url, json=payload, headers=headers)
-    # Consideriamo 200/201 come ok
-    if r.status_code not in (200, 201):
-        raise HTTPException(r.status_code, detail={"message": "NOWPayments payout error", "response": r.text})
-    data = r.json()
-    # normalizza un campo id se presente
-    payout_id = data.get("id") or data.get("payout_id") or data.get("data", {}).get("id")
-    return {"raw": data, "payout_id": payout_id}
-
+# ---------------------------
+# Trigger payout endpoint (reale)
+# ---------------------------
 @router.post("/offramp/trigger-payout/{order_id}")
 async def trigger_payout(order_id: int):
-    # carica ordine
     conn = _conn()
     cur = conn.cursor()
     sale = cur.execute("SELECT * FROM sales WHERE id=?", (order_id,)).fetchone()
     if not sale:
         conn.close()
         raise HTTPException(404, detail="Ordine non trovato")
-    if sale["status"] not in ("created", "failed"):
-        conn.close()
-        return {"order_id": order_id, "status": sale["status"], "nowpayments_payout_id": sale["nowpayments_payout_id"]}
 
-    # chiama NOWPayments
+    # idempotenza
+    if sale["status"] not in ("created", "failed"):
+        res = _rowdict(sale)
+        conn.close()
+        return res
+
+    # verifica campi necessari
+    if not sale["iban"] or not sale["beneficiary_name"]:
+        conn.close()
+        raise HTTPException(400, detail="IBAN o beneficiary_name mancanti")
+
+    # costruisci payout payload (adatta se il tuo account richiede campi extra)
+    withdrawal = {
+        "currency": "eur",
+        "amount": float(sale["eur_amount"]),
+        "address": sale["iban"],
+        "withdrawal_description": f"Offramp order #{order_id} - {sale['beneficiary_name']}",
+    }
+
+    # merge campi bancari extra da env JSON (se forniti)
+    if NOWPAYMENTS_BANK_EXTRA_JSON:
+        try:
+            extra = json.loads(NOWPAYMENTS_BANK_EXTRA_JSON)
+            if isinstance(extra, dict):
+                withdrawal.update(extra)
+        except Exception:
+            # ignora JSON malformato (ma log in futuro)
+            pass
+
+    payload = {"payouts": [withdrawal]}
+
+    # chiamata reale
     try:
-        res = await _create_nowpayments_payout(
-            amount_eur=float(sale["eur_amount"]),
-            iban=sale["iban"],
-            beneficiary=sale["beneficiary_name"],
-            note=f"Offramp order #{order_id} - {sale['beneficiary_name']}",
-        )
-        npid = res["payout_id"]
-        cur.execute("""
-            UPDATE sales SET status='payout_pending', nowpayments_payout_id=?, updated_at=datetime('now')
-            WHERE id=?
-        """, (npid, order_id))
-        conn.commit()
-        sale = cur.execute("SELECT * FROM sales WHERE id=?", (order_id,)).fetchone()
-        return _rowdict(sale) | {"nowpayments_response": res["raw"]}
-    except HTTPException:
+        res = await _call_nowpayments_payout(payload)
+    except HTTPException as e:
         conn.close()
-        raise
+        # Propaga il dettaglio del provider (senza cambiare lo stato dell'ordine)
+        raise e
     except Exception as e:
-        # fallimento generico
-        cur.execute("UPDATE sales SET status='failed', updated_at=datetime('now') WHERE id=?", (order_id,))
-        conn.commit()
+        # errore generico
         conn.close()
-        raise HTTPException(502, detail=f"Errore trigger payout: {e}")
-    finally:
+        raise HTTPException(status_code=502, detail=f"Errore interno creazione payout: {e}")
+
+    # Estrai payout_id coerente dalle possibili risposte
+    payout_id = None
+    if isinstance(res, dict):
+        payout_id = res.get("payout_id") or res.get("id")
+        if not payout_id:
+            # alcuni endpoint ritornano { "withdrawals": [ {"id": "..." , ...} ] }
+            withdrawals = res.get("withdrawals") or res.get("payouts") or []
+            if isinstance(withdrawals, (list, tuple)) and withdrawals:
+                first = withdrawals[0]
+                if isinstance(first, dict):
+                    payout_id = first.get("id") or first.get("payout_id")
+
+    if not payout_id:
+        # provider ha risposto 2xx ma senza payout_id: non proseguiamo
         conn.close()
+        raise HTTPException(status_code=502, detail={"error": "NOWPayments response without payout_id", "raw": res})
+
+    # Salva payout_id e imposta payout_pending
+    cur.execute("UPDATE sales SET nowpayments_payout_id=?, status='payout_pending', updated_at=datetime('now') WHERE id=?", (str(payout_id), order_id))
+    conn.commit()
+    sale = cur.execute("SELECT * FROM sales WHERE id=?", (order_id,)).fetchone()
+    conn.close()
+
+    out = _rowdict(sale)
+    out["_provider_raw"] = res
+    return out
