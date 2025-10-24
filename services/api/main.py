@@ -69,14 +69,37 @@ def nowpayments_health():
     try:
         h = np_headers()
         status_url = os.getenv("NP_STATUS_URL")
-        urls = [status_url] if status_url else [
-            "https://api.nowpayments.io/status",
-            f"{NP_BASE_URL}/status",
-            f"{NP_BASE_URL}/payouts",
-        ]
+        if status_url:
+            urls = [status_url]
+        else:
+            urls = [
+                "https://api.nowpayments.io/status",   # spesso 404 ma host raggiungibile
+                f"{NP_BASE_URL}/status",
+                f"{NP_BASE_URL}/payouts",
+            ]
+
         last = None
         for u in urls:
             try:
                 r = requests.get(u, headers=h, timeout=10)
-                if r.status_code in (200, 204):
-    return {"ok": True, "status_code": r.status_code, "checked": u, "auth_mode": "api_key" if not NP_USE_JWT else "jwt"}
+                # consideriamo OK anche 401/403/404/405: endpoint raggiungibile
+                if r.status_code in (200, 204, 401, 403, 404, 405):
+                    return {
+                        "ok": True,
+                        "status_code": r.status_code,
+                        "checked": u,
+                        "auth_mode": "api_key" if not NP_USE_JWT else "jwt",
+                    }
+                else:
+                    last = (u, r.status_code, r.text[:200])
+            except Exception as e:
+                last = (u, "error", str(e)[:200])
+
+        return {
+            "ok": False,
+            "status_code": last[1] if last else None,
+            "checked": last[0] if last else None,
+            "auth_mode": "api_key" if not NP_USE_JWT else "jwt",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
