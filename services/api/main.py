@@ -1,27 +1,45 @@
-# services/api/main.py
 import os, requests
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
 
+# ==========================================================
+#  🔧 CONFIGURAZIONE BASE
+# ==========================================================
 SERVICE_NAME = "changenow-offramp-pro"
-PROVIDER = os.getenv("PROVIDER", "nowpayments")
+PROVIDER = os.getenv("PROVIDER", "wise").lower()
 
+# --- NOWPayments ---
 NP_BASE_URL    = os.getenv("NP_BASE_URL", "https://api.nowpayments.io/v1").rstrip("/")
 NP_PAYOUT_PATH = os.getenv("NP_PAYOUT_PATH", "/payouts")
 NP_USE_JWT     = os.getenv("NP_USE_JWT", "false").lower() == "true"
 NP_API_KEY     = os.getenv("NP_API_KEY")
 
-app = FastAPI(title=SERVICE_NAME, version="1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+# --- Wise ---
+WISE_API_TOKEN = os.getenv("WISE_API_TOKEN")
+WISE_PROFILE_ID = os.getenv("WISE_PROFILE_ID")
+WISE_BASE_URL = "https://api.transferwise.com/v1"
+WISE_SOURCE_CURRENCY = os.getenv("WISE_SOURCE_CURRENCY", "EUR")
 
-# --- “DB” in memoria (sostituisci con il tuo storage) ---
+# ==========================================================
+#  ⚙️ FASTAPI SETUP
+# ==========================================================
+app = FastAPI(title=SERVICE_NAME, version="1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
 ORDERS: Dict[int, Dict] = {}
 LISTINGS: Dict[str, Dict] = {}
 
-# ---------- Schemi ----------
+# ==========================================================
+#  📦 MODELLI
+# ==========================================================
 class SetPriceIn(BaseModel):
     token_symbol: str
     price_eur: float
@@ -39,27 +57,108 @@ class CreateOrderIn(BaseModel):
 class PayoutIn(BaseModel):
     method: str = "SEPA"
 
-# ---------- Helpers NOWPayments ----------
+# ==========================================================
+#  🪙 FUNZIONI NOWPAYMENTS (crypto payouts)
+# ==========================================================
 def np_headers():
     if NP_USE_JWT:
-        # Se un domani vuoi JWT, sostituisci questa eccezione con la tua funzione di refresh.
-        raise RuntimeError("JWT non abilitato: imposta NP_USE_JWT=false per usare x-api-key")
+        raise RuntimeError("JWT non abilitato, imposta NP_USE_JWT=false per usare x-api-key")
     return {"x-api-key": NP_API_KEY, "Content-Type": "application/json"}
 
 def create_payout(payload: dict):
-    url = f"{NP_BASE_URL}{NP_PAYOUT_PATH}"
-    idem = payload.get("idempotency_key", f"np-{payload.get('order_id','')}")
+    base = NP_BASE_URL
     headers = np_headers()
+    idem = payload.get("idempotency_key", f"np-{payload.get('order_id','')}")
     headers["Idempotency-Key"] = idem
-    r = requests.post(url, json=payload, headers=headers, timeout=30)
-    try:
-        r.raise_for_status()
-    except Exception as e:
-        raise HTTPException(status_code=r.status_code,
-                            detail={"message": str(e), "response": r.text})
+
+    primary = f"{base}{NP_PAYOUT_PATH}"
+    alternate = f"{base}/payout" if NP_PAYOUT_PATH.rstrip("/") == "/payouts" else f"{base}/payouts"
+
+    for url in (primary, alternate):
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        if r.status_code == 404:
+            continue
+        try:
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            raise HTTPException(status_code=r.status_code,
+                                detail={"message": str(e), "response": r.text})
+    raise HTTPException(status_code=404, detail={"message": "Payout endpoint not found", "tried": [primary, alternate]})
+
+# ==========================================================
+#  💶 FUNZIONI WISE (SEPA payouts)
+# ==========================================================
+def wise_headers():
+    return {"Authorization": f"Bearer {WISE_API_TOKEN}", "Content-Type": "application/json"}
+
+def wise_create_quote(amount_eur: float):
+    url = f"{WISE_BASE_URL}/quotes"
+    payload = {
+        "profile": int(WISE_PROFILE_ID),
+        "sourceCurrency": WISE_SOURCE_CURRENCY,
+        "targetCurrency": "EUR",
+        "sourceAmount": amount_eur
+    }
+    r = requests.post(url, json=payload, headers=wise_headers(), timeout=30)
+    r.raise_for_status()
     return r.json()
 
-# ---------- Routes base / health ----------
+def wise_create_recipient(name: str, iban: str):
+    url = f"{WISE_BASE_URL}/accounts"
+    payload = {
+        "currency": "EUR",
+        "type": "iban",
+        "profile": int(WISE_PROFILE_ID),
+        "ownedByCustomer": False,
+        "details": {
+            "legalType": "PRIVATE",
+            "IBAN": iban,
+            "accountHolderName": name
+        }
+    }
+    r = requests.post(url, json=payload, headers=wise_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def wise_create_transfer(quote_id: str, recipient_id: int, amount_eur: float, note: str):
+    url = f"{WISE_BASE_URL}/transfers"
+    payload = {
+        "targetAccount": recipient_id,
+        "quoteUuid": quote_id,
+        "customerTransactionId": f"tx-{recipient_id}-{int(amount_eur*100)}",
+        "details": {
+            "reference": note,
+            "transferPurpose": "verification.transfers.payout",
+            "sourceOfFunds": "other"
+        }
+    }
+    r = requests.post(url, json=payload, headers=wise_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def wise_fund_transfer(transfer_id: int):
+    url = f"{WISE_BASE_URL}/transfers/{transfer_id}/payments"
+    payload = {"type": "BALANCE"}
+    r = requests.post(url, json=payload, headers=wise_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def wise_payout(name: str, iban: str, amount_eur: float, note: str):
+    quote = wise_create_quote(amount_eur)
+    recipient = wise_create_recipient(name, iban)
+    transfer = wise_create_transfer(quote["id"], recipient["id"], amount_eur, note)
+    fund = wise_fund_transfer(transfer["id"])
+    return {
+        "quote_id": quote["id"],
+        "recipient_id": recipient["id"],
+        "transfer_id": transfer["id"],
+        "fund_status": fund
+    }
+
+# ==========================================================
+#  🧩 ROTTE DI BASE
+# ==========================================================
 @app.get("/")
 def root():
     return {"ok": True, "service": SERVICE_NAME, "provider": PROVIDER}
@@ -78,39 +177,24 @@ def health(verbose: Optional[bool] = False):
 def nowpayments_health():
     try:
         h = np_headers()
-        status_url = os.getenv("NP_STATUS_URL")
-        urls = [status_url] if status_url else [
-            "https://api.nowpayments.io/status",
+        urls = [
             f"{NP_BASE_URL}/status",
-            f"{NP_BASE_URL}/payouts",
+            f"{NP_BASE_URL}/payouts"
         ]
-        last = None
         for u in urls:
             try:
                 r = requests.get(u, headers=h, timeout=10)
-                # Consideriamo OK anche 401/403/404/405 (host/endpoint raggiungibile)
                 if r.status_code in (200, 204, 401, 403, 404, 405):
-                    return {
-                        "ok": True,
-                        "status_code": r.status_code,
-                        "checked": u,
-                        "auth_mode": "api_key" if not NP_USE_JWT else "jwt",
-                    }
-                else:
-                    last = (u, r.status_code, r.text[:200])
-            except Exception as e:
-                last = (u, "error", str(e)[:200])
-
-        return {
-            "ok": False,
-            "status_code": last[1] if last else None,
-            "checked": last[0] if last else None,
-            "auth_mode": "api_key" if not NP_USE_JWT else "jwt",
-        }
+                    return {"ok": True, "status_code": r.status_code, "checked": u, "auth_mode": "api_key"}
+            except Exception:
+                continue
+        return {"ok": False, "status": "unreachable"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------- OTC LISTINGS ----------
+# ==========================================================
+#  💰 OTC LISTINGS
+# ==========================================================
 @app.get("/otc/listings")
 def get_listings(token_symbol: Optional[str] = None):
     if token_symbol:
@@ -126,25 +210,30 @@ def set_price(data: SetPriceIn):
     LISTINGS[sym] = {"price_eur": data.price_eur, "available_amount": data.available_amount}
     return {"ok": True, "token": sym, "price_eur": data.price_eur, "available_amount": data.available_amount}
 
-# ---------- CREATE ORDER ----------
+# ==========================================================
+#  🧾 CREATE ORDER
+# ==========================================================
 @app.post("/offramp/create-order")
 def create_order(data: CreateOrderIn):
     new_id = len(ORDERS) + 1
     eur_amount = data.amount_tokens * data.price_eur
     ORDERS[new_id] = {
-        "order_id": new_id, "status": "created",
+        "order_id": new_id,
+        "status": "created",
         "token_symbol": data.token_symbol.upper(),
-        "price_eur": data.price_eur, "amount_tokens": data.amount_tokens,
-        "beneficiary_name": data.beneficiary_name, "iban": data.iban,
-        "eur_amount": eur_amount, "redirect_url": data.redirect_url, "notes": data.notes,
+        "price_eur": data.price_eur,
+        "amount_tokens": data.amount_tokens,
+        "beneficiary_name": data.beneficiary_name,
+        "iban": data.iban,
+        "eur_amount": eur_amount,
+        "redirect_url": data.redirect_url,
+        "notes": data.notes,
     }
-    return {
-        "order_id": new_id, "status": "created",
-        "eur_amount": eur_amount, "price_eur": data.price_eur,
-        "token_symbol": data.token_symbol, "redirect_url": data.redirect_url
-    }
+    return {"order_id": new_id, "status": "created", "eur_amount": eur_amount, "price_eur": data.price_eur, "token_symbol": data.token_symbol, "redirect_url": data.redirect_url}
 
-# ---------- TRIGGER PAYOUT ----------
+# ==========================================================
+#  💸 TRIGGER PAYOUT (WISE + NOWPAYMENTS)
+# ==========================================================
 @app.post("/offramp/trigger-payout/{order_id}")
 def trigger_payout(order_id: str, payload: PayoutIn = Body(...)):
     try:
@@ -155,26 +244,43 @@ def trigger_payout(order_id: str, payload: PayoutIn = Body(...)):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    payout_payload = {
-        "order_id": order_key,
-        "currency": "EUR",
-        "amount": order["eur_amount"],
-        "payout_address": order["iban"],
-        "beneficiary_name": order["beneficiary_name"],
-        "method": payload.method,
-        "idempotency_key": f"payout-{order_key}",
-    }
-    try:
-        response = create_payout(payout_payload)
-        order["status"] = "queued"
-        order["payout_response"] = response
-        return {"ok": True, "order_id": order_key, "status": "queued", "response": response}
-    except HTTPException as e:
-        order["status"] = "failed"
-        order["payout_error"] = e.detail
-        raise
+    eur_amount = order["eur_amount"]
+    name = order["beneficiary_name"]
+    iban = order["iban"]
+    note = f"OTC payout {order_key}"
 
-# ---------- GET ORDER ----------
+    try:
+        if PROVIDER == "wise" or payload.method.upper() == "SEPA":
+            response = wise_payout(name, iban, eur_amount, note)
+            order["status"] = "queued"
+            order["payout_response"] = response
+            return {"ok": True, "provider": "wise", "order_id": order_key, "status": "queued", "response": response}
+
+        elif PROVIDER == "nowpayments" or payload.method.upper() == "CRYPTO":
+            response = create_payout({
+                "order_id": order_key,
+                "currency": "EUR",
+                "amount": eur_amount,
+                "payout_address": iban,
+                "beneficiary_name": name,
+                "method": payload.method,
+                "idempotency_key": f"payout-{order_key}"
+            })
+            order["status"] = "queued"
+            order["payout_response"] = response
+            return {"ok": True, "provider": "nowpayments", "order_id": order_key, "status": "queued", "response": response}
+
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported provider or method")
+
+    except Exception as e:
+        order["status"] = "failed"
+        order["payout_error"] = str(e)
+        raise HTTPException(status_code=500, detail={"message": str(e)})
+
+# ==========================================================
+#  📋 GET ORDER
+# ==========================================================
 @app.get("/offramp/orders/{order_id}")
 def get_order(order_id: str):
     try:
