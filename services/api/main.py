@@ -96,16 +96,47 @@ def root():
 
 
 # ---- HEALTH ----
-@app.get("/offramp/health")
-def health(verbose: Optional[bool] = False):
-    data = {"ok": True, "service": SERVICE_NAME, "provider": PROVIDER}
-    if verbose:
-        data.update({
-            "NP_BASE_URL": NP_BASE_URL,
-            "auth_mode": "jwt" if NP_USE_JWT else "api_key"
-        })
-    return data
+@app.get("/nowpayments/health")
+def nowpayments_health():
+    try:
+        h = np_headers()
+        status_url = os.getenv("NP_STATUS_URL")
+        if status_url:
+            urls = [status_url]
+        else:
+            # Prova più URL finché uno risponde "ragionevolmente"
+            urls = [
+                "https://api.nowpayments.io/status",    # status senza /v1 (quello giusto)
+                f"{NP_BASE_URL}/status",                # fallback (spesso 404)
+                f"{NP_BASE_URL}/payouts"               # reachability check (OPTIONS/GET può dare 200/204/405/401/403)
+            ]
 
+        last = None
+        for u in urls:
+            try:
+                # usa GET; se vuoi solo reachability su /payouts puoi usare OPTIONS
+                r = requests.get(u, headers=h, timeout=10)
+                # consideriamo "ok" anche 401/403/405 (endpoint raggiungibile, auth o metodo diverso)
+                if r.status_code in (200, 204, 401, 403, 405):
+                    return {
+                        "ok": True,
+                        "status_code": r.status_code,
+                        "checked": u,
+                        "auth_mode": "jwt" if NP_USE_JWT else "api_key"
+                    }
+                last = (u, r.status_code, r.text[:200])
+            except Exception as e:
+                last = (u, "error", str(e)[:200])
+
+        return {
+            "ok": False,
+            "status_code": last[1] if last else None,
+            "checked": last[0] if last else None,
+            "auth_mode": "jwt" if NP_USE_JWT else "api_key",
+            "note": "Fallback health failed"
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.get("/nowpayments/health")
 def nowpayments_health():
