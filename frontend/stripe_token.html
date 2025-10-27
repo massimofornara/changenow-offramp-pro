@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Token carta (PROD)</title>
+  <script src="https://js.stripe.com/v3/"></script>
+  <style>
+    body{font-family:system-ui,Arial;padding:20px;max-width:640px;margin:auto}
+    .StripeElement{height:44px;padding:10px 12px;border:1px solid #ccd0d2;border-radius:6px;background:#fff}
+    .row{margin-bottom:12px}.btn{padding:10px 14px;border-radius:6px;background:#635bff;color:#fff;border:0;cursor:pointer}
+    .log{white-space:pre-wrap;background:#f7f7f8;padding:10px;border-radius:6px;margin-top:12px}
+  </style>
+</head>
+<body>
+  <h2>Tokenizza carta (produzione)</h2>
+  <div class="row"><input id="cardholder-name" placeholder="Intestatario" style="width:100%;padding:8px;border:1px solid #ccc;border-radius:6px"></div>
+  <div id="card-element" class="StripeElement"></div>
+  <div class="row"><button id="create-token" class="btn">Crea token</button></div>
+  <div id="result" class="log"></div>
+
+<script>
+  const PUBLISHABLE_KEY = "pk_live_51RescFFg0ne9PIQaDRWDo9BY3tdsA2zIKGSpVod6LpWWrsklSGaubPsB63JoqGZs0Igiwu0Kxk8K2VqQShsTXVlg00eoEiKasz";
+  const stripe = Stripe(PUBLISHABLE_KEY);
+  const elements = stripe.elements({locale:"it"});
+  const card = elements.create("card");
+  card.mount("#card-element");
+
+  const resultEl = document.getElementById('result');
+  const show = (m)=> resultEl.textContent = typeof m==='string'? m : JSON.stringify(m,null,2);
+
+  document.getElementById('create-token').addEventListener('click', async ()=>{
+    show("Creo token...");
+    const name = document.getElementById('cardholder-name').value || "Anonimo";
+    const {token, error} = await stripe.createToken(card, { name });
+    if (error) return show("Errore: "+error.message);
+
+    show("Token creato: "+token.id+" — invio al backend...");
+    // Invia SOLO l'id del token al tuo backend
+    const resp = await fetch("/card-token", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ token: token.id, name })
+    });
+    const data = await resp.json();
+    show(data);
+  });
+</script>
+</body>
+</html>
