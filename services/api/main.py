@@ -1,458 +1,429 @@
-import os, uuid, time, threading, json
-from datetime import datetime
-from typing import Optional, Dict, Literal
-
-import requests
-from fastapi import FastAPI, HTTPException, Body, BackgroundTasks, Header, Query, Request
+import os, uuid, time, requests
+from typing import Dict, Optional
+from fastapi import FastAPI, HTTPException, Body, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # ==========================================================
-#  🔧 RUNTIME CONFIG (overridable via /config)
+# Config & App
 # ==========================================================
 SERVICE_NAME = "changenow-offramp-pro"
-RUNTIME = {
-    # Stripe (Card rail)
-    "STRIPE_API_KEY": os.getenv("STRIPE_API_KEY", ""),
-    "STRIPE_CONNECT_ACCOUNT": os.getenv("STRIPE_CONNECT_ACCOUNT", ""),   # acct_...
-    "STRIPE_PAYOUT_SPEED": os.getenv("STRIPE_PAYOUT_SPEED", "instant"),  # instant|standard
-    "STRIPE_API_BASE": os.getenv("STRIPE_API_BASE", "https://api.stripe.com").rstrip("/"),
+PROVIDER = os.getenv("PROVIDER", "stripe").lower()   # default rail se non specificato in trigger
 
-    # Wise (SEPA)
-    "WISE_API_TOKEN": os.getenv("WISE_API_TOKEN", ""),
-    "WISE_PROFILE_ID": os.getenv("WISE_PROFILE_ID", ""),
-    "WISE_SOURCE_CCY": os.getenv("WISE_SOURCE_CURRENCY", "EUR"),
-    "WISE_BASE_URL": os.getenv("WISE_BASE_URL", "https://api.transferwise.com").rstrip("/"),
+# Stripe (Card payouts via Connect external accounts)
+STRIPE_API_KEY        = os.getenv("STRIPE_API_KEY", "")
+STRIPE_CONNECT_ACCOUNT= os.getenv("STRIPE_CONNECT_ACCOUNT", "")  # opzionale
+STRIPE_PAYOUT_SPEED   = os.getenv("STRIPE_PAYOUT_SPEED", "instant")  # instant|standard
+STRIPE_API_BASE       = "https://api.stripe.com"
 
-    # NOWPayments (Crypto)
-    "NP_API_KEY": os.getenv("NP_API_KEY", ""),
-    "NP_BASE_URL": os.getenv("NP_BASE_URL", "https://api.nowpayments.io/v1").rstrip("/"),
-    "NP_PAYOUT_PATH": os.getenv("NP_PAYOUT_PATH", "/payouts"),
-    "NP_USE_JWT": os.getenv("NP_USE_JWT", "false").lower() == "true",
+# Wise (SEPA)
+WISE_API_TOKEN       = os.getenv("WISE_API_TOKEN", "")
+WISE_PROFILE_ID      = os.getenv("WISE_PROFILE_ID", "")
+WISE_SOURCE_CURRENCY = os.getenv("WISE_SOURCE_CURRENCY", "EUR")
+WISE_BASE_URL_ENV    = os.getenv("WISE_BASE_URL", "https://api.transferwise.com").rstrip("/")
 
-    # Misc card proxy knobs (as requested)
-    "CARD_API_URL": os.getenv("CARD_API_URL", ""),
-    "CARD_API_KEY": os.getenv("CARD_API_KEY", ""),
+# NOWPayments (Crypto)
+NP_API_KEY     = os.getenv("NP_API_KEY", "")
+NP_BASE_URL    = os.getenv("NP_BASE_URL", "https://api.nowpayments.io/v1").rstrip("/")
+NP_PAYOUT_PATH = os.getenv("NP_PAYOUT_PATH", "/payouts")  # verrà normalizzato sotto
+NP_USE_JWT     = os.getenv("NP_USE_JWT", "false").lower() == "true"  # normalmente FALSE
 
-    # Polling cadence
-    "POLL_INTERVAL_SEC": int(os.getenv("POLL_INTERVAL_SEC", "6")),
-    "POLL_MAX_SEC": int(os.getenv("POLL_MAX_SEC", "300")),
-}
+# CORS
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-# ==========================================================
-#  ⚙️ FASTAPI
-# ==========================================================
-app = FastAPI(title=SERVICE_NAME, version="3.0-production")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title=SERVICE_NAME, version="2.2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ==========================================================
-#  🗃️ IN-MEMORY STORE (replace with DB in prod)
+# In-memory storage (sostituisci con DB in produzione)
 # ==========================================================
-PAYOUTS: Dict[str, Dict] = {}
-LOCK = threading.Lock()
+ORDERS: Dict[int, Dict] = {}
+LISTINGS: Dict[str, Dict] = {}
 
 # ==========================================================
-#  📦 MODELS
+# Models
 # ==========================================================
-class Amount(BaseModel):
-    currency: str = Field("EUR", description="ISO 4217 (EUR/USD/GBP/...)")
-    value: float = Field(..., gt=0)
+class SetPriceIn(BaseModel):
+    token_symbol: str
+    price_eur: float
+    available_amount: Optional[int] = 0
 
-class CreatePayoutIn(BaseModel):
-    rail: Literal["CARD_VISA","CARD_MASTERCARD","SEPA","CRYPTO"]
-    amount: Amount
-    # Card (Stripe)
-    card_token: Optional[str] = None          # Stripe token for debit card (e.g. tok_visa_debit or tokenized PM)
-    # SEPA (Wise)
+class CreateOrderIn(BaseModel):
+    token_symbol: str
+    amount_tokens: float
+    price_eur: float
+    payout_channel: Optional[str] = None  # "CARD_VISA" | "CARD_MASTERCARD" | "SEPA" | "CRYPTO"
+    # Card
+    card_token: Optional[str] = None
+    # SEPA
     beneficiary_name: Optional[str] = None
     iban: Optional[str] = None
-    # Crypto (NOWPayments)
+    # Crypto
     wallet_address: Optional[str] = None
-    crypto_asset: Optional[str] = None        # USDT/BTC/USDC/ETH/BNB/SOL
-    crypto_network: Optional[str] = None      # TRC20/ERC20/BEP20/SOL/BTC...
-    # Misc
+    crypto_asset: Optional[str] = None      # USDT|BTC|USDC|ETH|BNB|SOL
+    crypto_network: Optional[str] = None    # TRC20|ERC20|BEP20|SOL|BTC...
+    # Generali
+    redirect_url: Optional[str] = None
     notes: Optional[str] = None
-    webhookUrl: Optional[str] = None
-    idempotencyKey: Optional[str] = None
 
-class PayoutStatus(BaseModel):
-    id: str
-    rail: str
-    status: Literal["queued","processing","completed","failed"]
-    amount: Amount
-    createdAt: datetime
-    updatedAt: datetime
-    webhookUrl: Optional[str] = None
-    failureReason: Optional[str] = None
-    provider: Optional[str] = None
-    provider_ids: Optional[Dict[str, str]] = None   # e.g. payout_id / transfer_id / external_id
-    raw: Optional[Dict] = None
+class PayoutIn(BaseModel):
+    method: str = ""  # se vuoto, usa order.payout_channel o default PROVIDER
+    # override opzionali
+    card_token: Optional[str] = None
+    beneficiary_name: Optional[str] = None
+    iban: Optional[str] = None
+    wallet_address: Optional[str] = None
+    crypto_asset: Optional[str] = None
+    crypto_network: Optional[str] = None
 
 # ==========================================================
-#  🔐 HELPERS
+# Helpers comuni
 # ==========================================================
-def mask(s: str) -> str:
-    if not s: return ""
-    return (s[:3] + "*"*(len(s)-6) + s[-3:]) if len(s) > 6 else "*"*len(s)
-
-def http_raise(r: requests.Response, extra=None):
+def http_raise(r: requests.Response, extra: Optional[dict] = None):
     if r.status_code >= 400:
-        detail = {"url": r.request.url, "status": r.status_code, "body": (r.text or "<empty>")[:4000]}
+        detail = {
+            "url": getattr(r.request, "url", ""),
+            "status": r.status_code,
+            "body": (r.text or "")[:2000]
+        }
         if extra: detail.update(extra)
         raise HTTPException(status_code=r.status_code, detail=detail)
 
-def send_webhook(url: Optional[str], payload: dict):
-    if not url: return
+def status_async_transition(order_id: int):
+    """Simula transizioni asincrone di stato (queued -> processing -> completed)."""
     try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception:
-        pass  # in prod: queue retry
-
-def set_status(pid: str, status: str, failure: Optional[str]=None, raw: Optional[Dict]=None):
-    with LOCK:
-        p = PAYOUTS.get(pid)
-        if not p: return
-        p["status"] = status
-        p["updatedAt"] = datetime.utcnow().isoformat()
-        if failure: p["failureReason"] = failure
-        if raw is not None: p["raw"] = raw
-        webhook = p.get("webhookUrl")
-        event = {"type": f"payout.{status}", "payout": p}
-    send_webhook(webhook, event)
+        time.sleep(1.5)
+        ORDERS[order_id]["status"] = "processing"
+        time.sleep(1.5)
+        # Se il provider ha un errore registrato, fallisci
+        if ORDERS[order_id].get("payout_error"):
+            ORDERS[order_id]["status"] = "failed"
+        else:
+            ORDERS[order_id]["status"] = "completed"
+    except Exception as e:
+        ORDERS[order_id]["status"] = "failed"
+        ORDERS[order_id]["payout_error"] = {"message": str(e)}
 
 # ==========================================================
-#  💳 STRIPE (Cards: Visa Direct / Mastercard Send via Connect)
+# Stripe (Card) helpers
 # ==========================================================
-def stripe_headers(account: Optional[str]=None):
-    if not RUNTIME["STRIPE_API_KEY"]:
+def s_headers(account: Optional[str] = None) -> dict:
+    if not STRIPE_API_KEY:
         raise HTTPException(400, "STRIPE_API_KEY missing")
-    h = {"Authorization": f"Bearer {RUNTIME['STRIPE_API_KEY']}"}
+    h = {"Authorization": f"Bearer {STRIPE_API_KEY}"}
     if account:
         h["Stripe-Account"] = account
     return h
 
-def stripe_form(d: Dict) -> Dict:
-    # Minimal x-www-form-urlencoded helper: Stripe accepts dict directly with requests
-    return d
+def stripe_add_external_card(card_token: str) -> str:
+    """Aggiungi la carta tokenizzata come external account sull'eventuale Connected Account."""
+    if STRIPE_CONNECT_ACCOUNT:
+        url = f"{STRIPE_API_BASE}/v1/accounts/{STRIPE_CONNECT_ACCOUNT}/external_accounts"
+        r = requests.post(url, headers=s_headers(STRIPE_CONNECT_ACCOUNT),
+                          data={"external_account": card_token}, timeout=30)
+        http_raise(r)
+        return r.json()["id"]  # "card_xxx"
+    else:
+        # In assenza di Connect, creiamo una "card token" utilizzabile per un Charge/PI (non payout direct).
+        # Qui simuliamo external_id = token (per esempio di routing interno).
+        return card_token
 
-def stripe_add_external_card(acct: str, card_token: str) -> str:
-    u = f"{RUNTIME['STRIPE_API_BASE']}/v1/accounts/{acct}/external_accounts"
-    data = {"external_account": card_token}
-    r = requests.post(u, headers=stripe_headers(acct), data=stripe_form(data), timeout=30)
-    http_raise(r)
-    return r.json()["id"]  # card_xxx
-
-def stripe_create_payout(acct: str, destination_external_id: str, amount: Amount, note: str) -> Dict:
-    u = f"{RUNTIME['STRIPE_API_BASE']}/v1/payouts"
-    cents = int(round(amount.value * 100))
-    data = {
-        "amount": cents,
-        "currency": amount.currency.lower(),
-        "method": RUNTIME["STRIPE_PAYOUT_SPEED"],
-        "destination": destination_external_id,
-        "description": note[:200],
-    }
-    r = requests.post(u, headers=stripe_headers(acct), data=stripe_form(data), timeout=30)
-    http_raise(r)
-    return r.json()
-
-def stripe_get_payout(acct: str, payout_id: str) -> Dict:
-    u = f"{RUNTIME['STRIPE_API_BASE']}/v1/payouts/{payout_id}"
-    r = requests.get(u, headers=stripe_headers(acct), timeout=30)
+def stripe_create_payout_to_external(external_id: str, amount_eur: float, speed: str = None):
+    """Crea payout su external account (richiede saldo e abilitazioni)."""
+    speed = speed or STRIPE_PAYOUT_SPEED
+    url = f"{STRIPE_API_BASE}/v1/payouts"
+    r = requests.post(url, headers=s_headers(STRIPE_CONNECT_ACCOUNT or None), timeout=30, data={
+        "amount": int(round(amount_eur * 100)),
+        "currency": "eur",
+        "method": speed,      # instant|standard
+        "destination": external_id,
+        "description": "OTC payout (card)"
+    })
     http_raise(r)
     return r.json()
 
 # ==========================================================
-#  💶 WISE (SEPA)
+# Wise (SEPA) helpers
 # ==========================================================
-def wise_headers():
-    if not RUNTIME["WISE_API_TOKEN"]:
+def wise_base_v1() -> str:
+    return f"{WISE_BASE_URL_ENV}/v1"
+
+def wise_headers() -> dict:
+    if not WISE_API_TOKEN:
         raise HTTPException(400, "WISE_API_TOKEN missing")
-    return {"Authorization": f"Bearer {RUNTIME['WISE_API_TOKEN']}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {WISE_API_TOKEN}", "Content-Type": "application/json"}
 
-def wise_base() -> str:
-    return RUNTIME["WISE_BASE_URL"].rstrip("/") + "/v1"
-
-def wise_create_quote(amount: Amount) -> Dict:
-    u = f"{wise_base()}/quotes"
-    pa = {
-        "profile": int(RUNTIME["WISE_PROFILE_ID"]),
-        "sourceCurrency": RUNTIME["WISE_SOURCE_CCY"],
-        "targetCurrency": amount.currency,
-        "sourceAmount": amount.value,
+def wise_create_quote(amount_eur: float) -> dict:
+    url = f"{wise_base_v1()}/quotes"
+    payload = {
+        "profile": int(WISE_PROFILE_ID),
+        "sourceCurrency": WISE_SOURCE_CURRENCY,
+        "targetCurrency": "EUR",
+        "sourceAmount": amount_eur,
         "rateType": "FIXED",
         "payOut": "BANK_TRANSFER",
         "preferredPayIn": "BALANCE",
     }
-    r = requests.post(u, json=pa, headers=wise_headers(), timeout=30)
+    r = requests.post(url, json=payload, headers=wise_headers(), timeout=30)
+    # fallback legacy se necessario
     if r.status_code == 400:
-        pb = {
-            "profile": int(RUNTIME["WISE_PROFILE_ID"]),
-            "source": RUNTIME["WISE_SOURCE_CCY"],
-            "target": amount.currency,
-            "sourceAmount": amount.value,
+        payload = {
+            "profile": int(WISE_PROFILE_ID),
+            "source": WISE_SOURCE_CURRENCY,
+            "target": "EUR",
+            "sourceAmount": amount_eur,
             "rateType": "FIXED",
             "payOut": "BANK_TRANSFER",
             "preferredPayIn": "BALANCE",
         }
-        r = requests.post(u, json=pb, headers=wise_headers(), timeout=30)
+        r = requests.post(url, json=payload, headers=wise_headers(), timeout=30)
     http_raise(r)
     return r.json()
 
-def wise_create_recipient(name: str, iban: str) -> Dict:
-    u = f"{wise_base()}/accounts"
+def wise_create_recipient(name: str, iban: str) -> dict:
+    url = f"{wise_base_v1()}/accounts"
     payload = {
         "currency": "EUR",
         "type": "iban",
-        "profile": int(RUNTIME["WISE_PROFILE_ID"]),
+        "profile": int(WISE_PROFILE_ID),
         "ownedByCustomer": False,
         "details": {"legalType": "PRIVATE", "IBAN": iban, "accountHolderName": name},
     }
-    r = requests.post(u, json=payload, headers=wise_headers(), timeout=30)
+    r = requests.post(url, json=payload, headers=wise_headers(), timeout=30)
     http_raise(r)
     return r.json()
 
-def wise_create_transfer(quote_id: str, recipient_id: int, note: str) -> Dict:
-    u = f"{wise_base()}/transfers"
+def wise_create_transfer(quote_id: str, recipient_id: int, note: str) -> dict:
+    url = f"{wise_base_v1()}/transfers"
     payload = {
         "targetAccount": recipient_id,
         "quoteUuid": quote_id,
-        "customerTransactionId": str(uuid.uuid4()),
+        "customerTransactionId": str(uuid.uuid4()),  # deve essere UUID
         "details": {
-            "reference": note[:35],
+            "reference": (note or "OTC payout")[:35],
             "transferPurpose": "verification.transfers.payout",
             "sourceOfFunds": "other",
         },
     }
-    r = requests.post(u, json=payload, headers=wise_headers(), timeout=30)
+    r = requests.post(url, json=payload, headers=wise_headers(), timeout=30)
     http_raise(r)
     return r.json()
 
-def wise_fund_transfer(transfer_id: int) -> Dict:
-    u = f"{wise_base()}/transfers/{transfer_id}/payments"
+def wise_fund_transfer(transfer_id: int) -> dict:
+    url = f"{wise_base_v1()}/transfers/{transfer_id}/payments"
     payload = {"type": "BALANCE"}
-    r = requests.post(u, json=payload, headers=wise_headers(), timeout=30)
+    r = requests.post(url, json=payload, headers=wise_headers(), timeout=30)
     http_raise(r)
     return r.json()
 
-# ==========================================================
-#  🪙 NOWPAYMENTS (CRYPTO)
-# ==========================================================
-def np_headers():
-    if RUNTIME["NP_USE_JWT"]:
-        raise HTTPException(400, "Use x-api-key; JWT not supported here")
-    if not RUNTIME["NP_API_KEY"]:
-        raise HTTPException(400, "NP_API_KEY missing")
-    return {"x-api-key": RUNTIME["NP_API_KEY"], "Content-Type": "application/json"}
+def wise_payout(name: str, iban: str, amount_eur: float, note: str) -> dict:
+    try:
+        q = wise_create_quote(amount_eur)
+    except HTTPException as e:
+        raise HTTPException(e.status_code, {"stage":"quote", **e.detail})
+    try:
+        rcp = wise_create_recipient(name, iban)
+    except HTTPException as e:
+        raise HTTPException(e.status_code, {"stage":"recipient", **e.detail})
+    try:
+        tr = wise_create_transfer(q["id"], rcp["id"], note)
+    except HTTPException as e:
+        raise HTTPException(e.status_code, {"stage":"transfer", **e.detail})
+    try:
+        fd = wise_fund_transfer(tr["id"])
+    except HTTPException as e:
+        # se mancano fondi, ritorna stato "manual_review"
+        if e.status_code in (400, 402, 422):
+            return {
+                "quote_id": q["id"], "recipient_id": rcp["id"],
+                "transfer_id": tr["id"],
+                "fund_status": {"fallback": True, "status": "manual_review", "reason": e.detail},
+            }
+        raise HTTPException(e.status_code, {"stage":"fund", **e.detail})
+    return {
+        "quote_id": q["id"], "recipient_id": rcp["id"],
+        "transfer_id": tr["id"], "fund_status": fd,
+    }
 
-def np_create_payout(payload: Dict) -> Dict:
-    base = RUNTIME["NP_BASE_URL"]
-    primary = f"{base}{RUNTIME['NP_PAYOUT_PATH']}"
-    alt = f"{base}/payout" if RUNTIME["NP_PAYOUT_PATH"].rstrip("/") == "/payouts" else f"{base}/payouts"
-    for url in (primary, alt):
+# ==========================================================
+# NOWPayments (Crypto) helpers
+# ==========================================================
+def np_headers() -> dict:
+    if NP_USE_JWT:
+        raise HTTPException(400, "NP_USE_JWT=true non supportato in questa build (usa x-api-key).")
+    if not NP_API_KEY:
+        raise HTTPException(400, "NP_API_KEY missing")
+    return {"x-api-key": NP_API_KEY, "Content-Type": "application/json"}
+
+def np_try_payout(payload: dict) -> dict:
+    """Prova più endpoint noti, perché la disponibilità varia per account."""
+    base = NP_BASE_URL
+    paths = [
+        NP_PAYOUT_PATH,                 # es. /payouts
+        "/payouts", "/payout", "/mass-payout", "/payments", "/withdrawal"
+    ]
+    tried = []
+    for p in paths:
+        url = f"{base}{p if p.startswith('/') else '/'+p}"
+        tried.append(url)
         r = requests.post(url, json=payload, headers=np_headers(), timeout=30)
         if r.status_code == 404:
             continue
         http_raise(r)
         return r.json()
-    raise HTTPException(404, "NOWPayments payout endpoint not found")
+    raise HTTPException(404, {"message":"NP payout endpoint not found", "tried": tried})
+
+def np_payout(asset: str, address: str, amount_eur: float, network: Optional[str], order_id: int) -> dict:
+    payload = {
+        "asset": asset.upper(),
+        "amount_fiat": float(amount_eur),
+        "fiat_currency": "EUR",
+        "destination_address": address,
+        "network": (network or "").upper() or None,
+        "idempotency_key": f"payout-{order_id}",
+        "order_id": order_id
+    }
+    return np_try_payout(payload)
 
 # ==========================================================
-#  🔄 ASYNC POLLERS (emit real outbound webhooks)
-# ==========================================================
-def poll_stripe_until_done(pid: str):
-    with LOCK:
-        p = PAYOUTS.get(pid); 
-        if not p: return
-        acct = RUNTIME["STRIPE_CONNECT_ACCOUNT"]
-        payout_id = p["provider_ids"].get("stripe_payout_id")
-    start = time.time()
-    set_status(pid, "processing")
-    while time.time() - start < RUNTIME["POLL_MAX_SEC"]:
-        try:
-            res = stripe_get_payout(acct, payout_id)
-            status = res.get("status")  # paid|pending|canceled|failed
-            if status in ("paid","canceled","failed"):
-                if status == "paid":
-                    set_status(pid, "completed", raw=res)
-                elif status == "canceled":
-                    set_status(pid, "failed", "stripe:canceled", raw=res)
-                else:
-                    set_status(pid, "failed", "stripe:failed", raw=res)
-                return
-        except HTTPException as e:
-            set_status(pid, "failed", f"stripe: {e.detail}", raw=None)
-            return
-        time.sleep(RUNTIME["POLL_INTERVAL_SEC"])
-    set_status(pid, "failed", "stripe: timeout", raw=None)
-
-def poll_wise_until_done(pid: str):
-    # Wise funding call is synchronous; on errors we mark failed/manual_review earlier.
-    # Here emulate "processing" → "completed" quickly.
-    set_status(pid, "processing")
-    time.sleep(max(2, RUNTIME["POLL_INTERVAL_SEC"]))
-    set_status(pid, "completed")
-
-def poll_nowp_until_done(pid: str):
-    # If NOWP returns an id/tx, you could poll their endpoint; here we simulate with a short delay.
-    set_status(pid, "processing")
-    time.sleep(max(2, RUNTIME["POLL_INTERVAL_SEC"]))
-    set_status(pid, "completed")
-
-# ==========================================================
-#  📍 ENDPOINTS
+# Routes
 # ==========================================================
 @app.get("/health")
 def health():
     return {
-        "ok": True, "service": SERVICE_NAME,
-        "rails": ["CARD_VISA","CARD_MASTERCARD","SEPA","CRYPTO"],
-        "stripe": {"connect_account": RUNTIME["STRIPE_CONNECT_ACCOUNT"], "speed": RUNTIME["STRIPE_PAYOUT_SPEED"]},
-        "wise": {"profile_id": RUNTIME["WISE_PROFILE_ID"], "base": RUNTIME["WISE_BASE_URL"]},
-        "np": {"base": RUNTIME["NP_BASE_URL"], "path": RUNTIME["NP_PAYOUT_PATH"]}
+        "ok": True,
+        "service": SERVICE_NAME,
+        "provider_default": PROVIDER,
+        "rails": {
+            "card(stripe)": bool(STRIPE_API_KEY),
+            "sepa(wise)": bool(WISE_API_TOKEN and WISE_PROFILE_ID),
+            "crypto(nowpayments)": bool(NP_API_KEY),
+        }
     }
 
-class ConfigSetIn(BaseModel):
-    CARD_API_URL: Optional[str] = None
-    CARD_API_KEY: Optional[str] = None
-    STRIPE_API_KEY: Optional[str] = None
-    STRIPE_CONNECT_ACCOUNT: Optional[str] = None
-    STRIPE_PAYOUT_SPEED: Optional[str] = None
-    WISE_API_TOKEN: Optional[str] = None
-    WISE_PROFILE_ID: Optional[str] = None
-    WISE_BASE_URL: Optional[str] = None
-    NP_API_KEY: Optional[str] = None
-    NP_BASE_URL: Optional[str] = None
-    NP_PAYOUT_PATH: Optional[str] = None
-    POLL_INTERVAL_SEC: Optional[int] = Field(None, ge=2, le=60)
-    POLL_MAX_SEC: Optional[int] = Field(None, ge=10, le=3600)
+# --- OTC listing ---
+@app.post("/otc/set-price")
+def set_price(data: SetPriceIn):
+    sym = data.token_symbol.upper()
+    LISTINGS[sym] = {"price_eur": data.price_eur, "available_amount": data.available_amount, "updated": int(time.time())}
+    return {"ok": True, "token": sym, "price_eur": data.price_eur, "available_amount": data.available_amount}
 
-@app.get("/config")
-def get_config(reveal: bool = Query(False)):
-    # mask secrets by default
-    return {
-        "CARD_API_URL": RUNTIME["CARD_API_URL"],
-        "CARD_API_KEY": RUNTIME["CARD_API_KEY"] if reveal else mask(RUNTIME["CARD_API_KEY"]),
-        "STRIPE_CONNECT_ACCOUNT": RUNTIME["STRIPE_CONNECT_ACCOUNT"],
-        "STRIPE_API_KEY": RUNTIME["STRIPE_API_KEY"] if reveal else mask(RUNTIME["STRIPE_API_KEY"]),
-        "WISE_PROFILE_ID": RUNTIME["WISE_PROFILE_ID"],
-        "WISE_API_TOKEN": RUNTIME["WISE_API_TOKEN"] if reveal else mask(RUNTIME["WISE_API_TOKEN"]),
-        "NP_BASE_URL": RUNTIME["NP_BASE_URL"],
-        "NP_API_KEY": RUNTIME["NP_API_KEY"] if reveal else mask(RUNTIME["NP_API_KEY"]),
-        "POLL_INTERVAL_SEC": RUNTIME["POLL_INTERVAL_SEC"],
-        "POLL_MAX_SEC": RUNTIME["POLL_MAX_SEC"],
+# --- Create order ---
+@app.post("/offramp/create-order")
+def create_order(data: CreateOrderIn):
+    new_id = len(ORDERS) + 1
+    eur_amount = data.amount_tokens * data.price_eur
+    ORDERS[new_id] = {
+        "order_id": new_id,
+        "status": "created",
+        "token_symbol": data.token_symbol.upper(),
+        "price_eur": data.price_eur,
+        "amount_tokens": data.amount_tokens,
+        "payout_channel": (data.payout_channel or "").upper() or None,
+        # Card
+        "card_token": data.card_token,
+        # SEPA
+        "beneficiary_name": data.beneficiary_name,
+        "iban": data.iban,
+        # Crypto
+        "wallet_address": data.wallet_address,
+        "crypto_asset": (data.crypto_asset or "").upper() or None,
+        "crypto_network": (data.crypto_network or "").upper() or None,
+        # Generic
+        "eur_amount": eur_amount,
+        "redirect_url": data.redirect_url,
+        "notes": data.notes,
+        "created": int(time.time()),
     }
+    return {"order_id": new_id, "status": "created", "eur_amount": eur_amount, "price_eur": data.price_eur, "token_symbol": data.token_symbol}
 
-@app.post("/config")
-def set_config(cfg: ConfigSetIn):
-    for k, v in cfg.dict(exclude_unset=True).items():
-        RUNTIME[k] = v if not isinstance(v, str) else v.strip()
-    return {"ok": True, "config": get_config(reveal=False)}
-
-@app.post("/payouts", response_model=PayoutStatus)
-def create_payout(data: CreatePayoutIn, background: BackgroundTasks):
-    pid = uuid.uuid4().hex
-    now = datetime.utcnow()
-    record = {
-        "id": pid,
-        "rail": data.rail,
-        "status": "queued",
-        "amount": data.amount.model_dump(),
-        "createdAt": now.isoformat(),
-        "updatedAt": now.isoformat(),
-        "webhookUrl": data.webhookUrl,
-        "provider": None,
-        "provider_ids": {},
-        "raw": None,
-        "failureReason": None,
-    }
-
-    # Dispatch by rail
+# --- Trigger payout ---
+@app.post("/offramp/trigger-payout/{order_id}")
+def trigger_payout(order_id: str, payload: PayoutIn = Body(...), bg: BackgroundTasks = None):
+    # fetch order
     try:
-        if data.rail in ("CARD_VISA","CARD_MASTERCARD"):
-            if not (RUNTIME["STRIPE_API_KEY"] and RUNTIME["STRIPE_CONNECT_ACCOUNT"]):
-                raise HTTPException(400, "Stripe not configured (STRIPE_API_KEY / STRIPE_CONNECT_ACCOUNT)")
-            if not data.card_token:
-                raise HTTPException(400, "card_token required for card rail")
-            # external account
-            ext_id = stripe_add_external_card(RUNTIME["STRIPE_CONNECT_ACCOUNT"], data.card_token)
-            pay = stripe_create_payout(RUNTIME["STRIPE_CONNECT_ACCOUNT"], ext_id, data.amount, data.notes or f"OTC payout {pid}")
-            record["provider"] = "stripe"
-            record["provider_ids"] = {"stripe_external_id": ext_id, "stripe_payout_id": pay.get("id")}
-            record["raw"] = {"payout": pay}
+        key = int(order_id)
+    except ValueError:
+        raise HTTPException(400, "order_id must be integer")
+    order = ORDERS.get(key)
+    if not order:
+        raise HTTPException(404, "Order not found")
 
-            # enqueue poller
-            background.add_task(poll_stripe_until_done, pid)
+    # rail effettiva
+    method = (payload.method or order.get("payout_channel") or "").upper()
+    if not method:
+        # fallback: default provider
+        method = {"stripe":"CARD_VISA", "wise":"SEPA", "nowpayments":"CRYPTO"}.get(PROVIDER, "CARD_VISA")
 
-        elif data.rail == "SEPA":
-            if not (RUNTIME["WISE_API_TOKEN"] and RUNTIME["WISE_PROFILE_ID"]):
-                raise HTTPException(400, "Wise not configured (WISE_API_TOKEN / WISE_PROFILE_ID)")
-            if not (data.beneficiary_name and data.iban):
+    eur_amount = float(order["eur_amount"])
+    note = order.get("notes") or f"OTC payout {key}"
+
+    try:
+        if method in ("CARD_VISA", "CARD_MASTERCARD"):
+            token = payload.card_token or order.get("card_token")
+            if not token:
+                raise HTTPException(400, "card_token required for card payout")
+            external_id = stripe_add_external_card(token)
+            # crea payout (richiede saldo/abilitazioni)
+            payout = stripe_create_payout_to_external(external_id, eur_amount, STRIPE_PAYOUT_SPEED)
+            order["status"] = "queued"
+            order["payout_response"] = {"external_id": external_id, "payout": payout}
+            if bg: bg.add_task(status_async_transition, key)
+            return {"ok": True, "provider": "stripe", "order_id": key, "status": "queued", "response": order["payout_response"]}
+
+        elif method == "SEPA":
+            name = (payload.beneficiary_name or order.get("beneficiary_name"))
+            iban = (payload.iban or order.get("iban"))
+            if not (name and iban):
                 raise HTTPException(400, "beneficiary_name and iban required for SEPA")
-            q = wise_create_quote(data.amount)
-            r = wise_create_recipient(data.beneficiary_name, data.iban)
-            t = wise_create_transfer(q["id"], r["id"], data.notes or f"OTC payout {pid}")
-            try:
-                f = wise_fund_transfer(t["id"])
-                record["raw"] = {"quote": q, "recipient": r, "transfer": t, "fund": f}
-                record["provider_ids"] = {"wise_transfer_id": str(t["id"])}
-                record["provider"] = "wise"
-                background.add_task(poll_wise_until_done, pid)
-            except HTTPException as e:
-                # Insufficient balance / other fund errors → failed
-                record["provider"] = "wise"
-                record["provider_ids"] = {"wise_transfer_id": str(t["id"])}
-                record["raw"] = {"quote": q, "recipient": r, "transfer": t, "fund_error": e.detail}
-                record["failureReason"] = str(e.detail)
-                record["status"] = "failed"
+            resp = wise_payout(name, iban, eur_amount, note)
+            # se funding fallisce per fondi insufficienti → manual_review
+            if resp.get("fund_status", {}).get("fallback"):
+                order["status"] = "manual_review"
+            else:
+                order["status"] = "queued"
+                if bg: bg.add_task(status_async_transition, key)
+            order["payout_response"] = resp
+            return {"ok": True, "provider": "wise", "order_id": key, "status": order["status"], "response": resp}
 
-        elif data.rail == "CRYPTO":
-            if not (RUNTIME["NP_API_KEY"] and data.wallet_address and data.crypto_asset):
-                raise HTTPException(400, "NP_API_KEY, wallet_address and crypto_asset required")
-            np_payload = {
-                "order_id": pid,
-                "asset": data.crypto_asset.upper(),
-                "network": (data.crypto_network or "").upper() or None,
-                "amount_fiat": data.amount.value,
-                "fiat_currency": data.amount.currency,
-                "destination_address": data.wallet_address,
-                "idempotency_key": data.idempotencyKey or f"payout-{pid}",
-            }
-            resp = np_create_payout(np_payload)
-            record["provider"] = "nowpayments"
-            record["provider_ids"] = {"np_order_id": resp.get("id") or resp.get("order_id") or str(pid)}
-            record["raw"] = {"np": resp}
-            background.add_task(poll_nowp_until_done, pid)
+        elif method == "CRYPTO":
+            asset  = (payload.crypto_asset or order.get("crypto_asset") or "").upper()
+            wallet = payload.wallet_address or order.get("wallet_address")
+            net    = (payload.crypto_network or order.get("crypto_network") or None)
+            if not (NP_API_KEY and asset and wallet):
+                raise HTTPException(400, "NP_API_KEY, crypto_asset and wallet_address required for CRYPTO payout")
+            resp = np_payout(asset, wallet, eur_amount, net, key)
+            order["status"] = "queued"
+            order["payout_response"] = resp
+            if bg: bg.add_task(status_async_transition, key)
+            return {"ok": True, "provider": "nowpayments", "order_id": key, "status": "queued", "response": resp}
 
         else:
-            raise HTTPException(400, f"Unsupported rail {data.rail}")
+            raise HTTPException(400, f"Unsupported payout method: {method}")
 
     except HTTPException as e:
-        record["status"] = "failed"
-        record["failureReason"] = str(e.detail)
+        order["status"] = "failed"
+        order["payout_error"] = e.detail
+        raise
+    except Exception as e:
+        order["status"] = "failed"
+        order["payout_error"] = {"message": str(e)}
+        raise HTTPException(500, {"message": str(e)})
 
-    with LOCK:
-        PAYOUTS[pid] = record
-
-    # Emit initial webhook
-    send_webhook(record.get("webhookUrl"), {"type": "payout.queued", "payout": record})
-
-    return PayoutStatus(**record)
-
-@app.get("/payouts/{payout_id}", response_model=PayoutStatus)
-def get_payout(payout_id: str):
-    with LOCK:
-        p = PAYOUTS.get(payout_id)
-        if not p: raise HTTPException(404, "Payout not found")
-        return PayoutStatus(**p)
-
-# Optional echo endpoint to verify outbound webhooks
-@app.post("/webhooks/echo")
-async def webhook_echo(req: Request):
-    body = await req.body()
-    return {"ok": True, "received": json.loads(body or b"{}")}
-
-@app.get("/")
-def root():
-    return {"ok": True, "service": SERVICE_NAME, "rails": ["CARD_VISA","CARD_MASTERCARD","SEPA","CRYPTO"]}
+# --- Get order ---
+@app.get("/offramp/orders/{order_id}")
+def get_order(order_id: str):
+    try:
+        key = int(order_id)
+    except ValueError:
+        raise HTTPException(400, "order_id must be integer")
+    order = ORDERS.get(key)
+    if not order:
+        raise HTTPException(404, "Order not found")
+    return order
