@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 # -------------------------------------
 # App & Config
 # -------------------------------------
-app = FastAPI(title="ChangeNOW Offramp Pro", version="4.2.0")
+app = FastAPI(title="ChangeNOW Offramp Pro", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,6 +67,12 @@ class Price(Base):
     available_amount = Column(Float, default=0)
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
+    # auto-payout on listing
+    wallet_address = Column(String(128))          # dove pagare (es. TRC20)
+    auto_payout_done = Column(Integer, default=0) # 0/1 idempotenza
+    auto_payout_txid = Column(String(128))        # riferimento provider
+    notes = Column(Text)                          # log provider
+
 
 class Order(Base):
     __tablename__ = "orders"
@@ -81,7 +87,7 @@ class Order(Base):
     crypto_asset = Column(String(32))
     crypto_network = Column(String(32))
     notes = Column(Text)
-    status = Column(String(32), default="created", nullable=False)
+    status = Column(String(32), default="created", nullable=False)  # created|queued|completed|failed
     payout_txid = Column(String(128))  # id/txid del provider
 
 
@@ -107,6 +113,9 @@ class SetPriceIn(BaseModel):
     token_symbol: str
     price_eur: float
     available_amount: Optional[float] = None
+    # auto payout
+    wallet_address: Optional[str] = None
+    slippage_bps: int = Field(default=50, ge=0, le=2000)  # default 0.50%
 
 
 class CreateOrderIn(BaseModel):
@@ -126,11 +135,11 @@ class PayoutIn(BaseModel):
     crypto_asset: Optional[str] = None
     crypto_network: Optional[str] = None
     crypto_amount: Optional[float] = None   # se assente, calcoliamo da EUR
-    slippage_bps: int = Field(default=0, ge=0, le=2000)  # 0..2000 bps (0..20%)
+    slippage_bps: int = Field(default=0, ge=0, le=2000)  # 0..20%
 
 
 # -------------------------------------
-# Utils
+# Utils (NOWPayments)
 # -------------------------------------
 def verify_nowpayments_signature(raw_body: bytes, signature: str) -> bool:
     if not signature:
@@ -140,7 +149,7 @@ def verify_nowpayments_signature(raw_body: bytes, signature: str) -> bool:
 
 
 def build_np_currency(asset: str, network: str) -> str:
-    """Converte (USDT, TRC20) -> 'USDTTRC20' (convenzione NOWPayments)."""
+    """(USDT, TRC20) -> 'USDTTRC20'."""
     return f"{(asset or '').upper()}{(network or '').upper()}"
 
 
@@ -152,10 +161,9 @@ def np_headers() -> dict:
 
 def nowpayments_convert_eur_to_crypto(eur_amount: float, currency: str) -> float:
     """
-    Tenta la conversione EUR -> currency usando API NOWPayments.
-    Usa 2 endpoint compatibili e ritorna la quantità crypto.
+    Converts EUR -> target currency via NOWPayments public endpoints.
     """
-    # Tentativo 1: /v1/rate
+    # 1) /v1/rate
     try:
         url = f"{NP_BASE_URL}/v1/rate"
         params = {"currency_from": "EUR", "currency_to": currency, "amount": eur_amount}
@@ -168,7 +176,7 @@ def nowpayments_convert_eur_to_crypto(eur_amount: float, currency: str) -> float
     except Exception as e:
         log.warning(f"np rate v1/rate failed: {e}")
 
-    # Tentativo 2: /v1/estimate
+    # 2) /v1/estimate
     try:
         url = f"{NP_BASE_URL}/v1/estimate"
         params = {"amount": eur_amount, "currency_from": "eur", "currency_to": currency}
@@ -184,13 +192,18 @@ def nowpayments_convert_eur_to_crypto(eur_amount: float, currency: str) -> float
     raise HTTPException(status_code=502, detail="Cannot fetch EUR→crypto rate from NOWPayments")
 
 
-def nowpayments_create_payout(*, address: str, amount: float, currency: str) -> dict:
+def nowpayments_create_payout(*, address: str, amount: float, currency: str, external_id: Optional[str] = None) -> dict:
     """
-    Crea un payout su NOWPayments (mass-payout con singolo withdrawal).
+    Crea un payout su NOWPayments (mass-payout con un singolo withdrawal).
     """
     url = f"{NP_BASE_URL}/v1/payouts"
     headers = np_headers()
     body = {"withdrawals": [{"address": address, "amount": float(amount), "currency": currency}]}
+    # facoltativi ma utili
+    body["ipn_callback_url"] = "https://changenow-offramp-pro.onrender.com/webhooks/nowpayments"
+    if external_id:
+        body["external_id"] = str(external_id)
+
     try:
         resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=30)
     except requests.RequestException as e:
@@ -198,13 +211,69 @@ def nowpayments_create_payout(*, address: str, amount: float, currency: str) -> 
         raise HTTPException(status_code=502, detail="NOWPayments network error")
 
     if resp.status_code >= 400:
-        log.error(f"nowpayments_create_payout http {resp.status_code}: {resp.text}")
-        raise HTTPException(status_code=502, detail="NOWPayments rejected payout request")
+        err_text = resp.text[:1000]
+        log.error(f"nowpayments_create_payout http {resp.status_code}: {err_text}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"NOWPayments rejected payout request (HTTP {resp.status_code}): {err_text}"
+        )
 
     try:
         return resp.json()
     except Exception:
         return {"raw": resp.text}
+
+
+# -------------------------------------
+# Auto-payout on listing
+# -------------------------------------
+def auto_payout_on_listing(db: Session, price_row: Price, wallet_address: str, slippage_bps: int = 50):
+    """
+    Esegue payout automatico (crypto) per il valore totale listato:
+    eur_total = price_eur * available_amount  → convert a crypto → payout NOWPayments.
+    Idempotente con price_row.auto_payout_done.
+    """
+    if price_row.auto_payout_done:
+        log.info(f"[auto] payout già eseguito per {price_row.token_symbol}")
+        return
+
+    eur_total = float(price_row.price_eur) * float(price_row.available_amount or 0)
+    if eur_total <= 0:
+        log.info(f"[auto] eur_total=0 per {price_row.token_symbol}, skip")
+        return
+
+    currency = "USDTTRC20"  # puoi rendere parametrico se vuoi
+    estimated_crypto = nowpayments_convert_eur_to_crypto(eur_total, currency)
+
+    # slippage bps (0..2000 bps)
+    bps = max(0, min(2000, int(slippage_bps or 0)))
+    crypto_to_send = estimated_crypto * (1.0 + bps / 10_000.0)
+
+    np_resp = nowpayments_create_payout(
+        address=wallet_address,
+        amount=float(crypto_to_send),
+        currency=currency,
+        external_id=f"listing_{price_row.token_symbol}"
+    )
+
+    snippet = json.dumps(np_resp)[:4000]
+    notes_old = price_row.notes or ""
+    price_row.notes = (notes_old + f" | auto_np_resp={snippet}").strip()
+
+    # estrai id/txid
+    payout_ref = None
+    if isinstance(np_resp, dict):
+        if "id" in np_resp:
+            payout_ref = str(np_resp["id"])
+        elif "withdrawals" in np_resp and isinstance(np_resp["withdrawals"], list) and np_resp["withdrawals"]:
+            wid = np_resp["withdrawals"][0]
+            payout_ref = str(wid.get("id") or wid.get("txid") or "")
+
+    price_row.auto_payout_txid = payout_ref
+    price_row.auto_payout_done = 1
+    db.add(price_row)
+    db.commit()
+    log.info(f"[auto] payout creato per {price_row.token_symbol} ref={payout_ref}")
 
 
 # -------------------------------------
@@ -217,28 +286,53 @@ def health():
 
 @app.post("/otc/set-price")
 def set_price(payload: SetPriceIn, db: Session = Depends(get_db)):
+    """
+    Listing OTC + (opzionale) auto-payout immediato se si passa wallet_address.
+    """
     token = payload.token_symbol.upper()
     price = db.query(Price).filter(Price.token_symbol == token).one_or_none()
     if price is None:
         price = Price(token_symbol=token)
-    price.price_eur = payload.price_eur
-    price.available_amount = payload.available_amount or 0
+
+    price.price_eur = float(payload.price_eur)
+    price.available_amount = float(payload.available_amount or 0)
     price.updated_at = datetime.utcnow()
+    price.wallet_address = payload.wallet_address or price.wallet_address
     db.add(price)
     db.commit()
-    return {"ok": True, "token_symbol": token, "price_eur": price.price_eur}
+    db.refresh(price)
+
+    auto_ref = None
+    if payload.wallet_address:  # auto payout solo se ci passi il wallet
+        try:
+            auto_payout_on_listing(db, price, payload.wallet_address, payload.slippage_bps)
+            auto_ref = price.auto_payout_txid
+        except HTTPException as e:
+            # restituisco l'errore provider per trasparenza
+            raise e
+        except Exception as e:
+            log.error(f"Auto payout non eseguito per {token}: {e}")
+
+    return {
+        "ok": True,
+        "token_symbol": token,
+        "price_eur": price.price_eur,
+        "available_amount": price.available_amount,
+        "updated_at": price.updated_at.isoformat(),
+        "auto_payout_txid": auto_ref
+    }
 
 
 @app.post("/offramp/create-order")
 def create_order(payload: CreateOrderIn, db: Session = Depends(get_db)):
     token = payload.token_symbol.upper()
     price_row = db.query(Price).filter(Price.token_symbol == token).one_or_none()
-    price_eur = price_row.price_eur if price_row else payload.price_eur
-    eur_amount = payload.amount_tokens * price_eur
+    price_eur = float(price_row.price_eur) if price_row else float(payload.price_eur)
+    eur_amount = float(payload.amount_tokens) * price_eur
 
     order = Order(
         token_symbol=token,
-        amount_tokens=payload.amount_tokens,
+        amount_tokens=float(payload.amount_tokens),
         price_eur=price_eur,
         eur_amount=eur_amount,
         payout_channel=payload.payout_channel.upper(),
@@ -263,64 +357,49 @@ def create_order(payload: CreateOrderIn, db: Session = Depends(get_db)):
 @app.post("/offramp/trigger-payout/{order_id}")
 def trigger_payout(order_id: int, payload: PayoutIn, db: Session = Depends(get_db)):
     """
-    Avvia payout reale su NOWPayments e lascia l'ordine in 'queued'.
-    - Se crypto_amount è assente, converte automaticamente EUR -> crypto via API NOWPayments.
-    - Applica slippage_bps (basis points) all'importo calcolato.
-    - Salva la risposta provider in notes e memorizza un riferimento in payout_txid (id/txid).
+    Avvia payout NOWPayments per l'ordine (resta 'queued' finché non arriva il webhook 'finished').
     """
     order = db.query(Order).filter(Order.id == order_id).one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Aggiorna info crypto se fornite
+    # aggiorna info crypto se fornite
     order.wallet_address = payload.wallet_address or order.wallet_address
     order.crypto_asset = (payload.crypto_asset or order.crypto_asset or "").upper()
     order.crypto_network = (payload.crypto_network or order.crypto_network or "").upper()
 
     if (payload.method or "").upper() != "CRYPTO" and order.payout_channel != "CRYPTO":
         raise HTTPException(status_code=422, detail="Only CRYPTO payout supported in this endpoint")
-
     if not order.wallet_address or not order.crypto_asset or not order.crypto_network:
         raise HTTPException(status_code=422, detail="Missing wallet_address / crypto_asset / crypto_network")
 
     currency_code = build_np_currency(order.crypto_asset, order.crypto_network)
 
-    # Calcolo importo crypto
+    # calcolo importo crypto (se non fornito)
     if payload.crypto_amount is not None:
         crypto_amt = float(payload.crypto_amount)
     else:
-        crypto_amt = nowpayments_convert_eur_to_crypto(order.eur_amount, currency_code)
+        est = nowpayments_convert_eur_to_crypto(order.eur_amount, currency_code)
+        bps = max(0, min(2000, int(payload.slippage_bps or 0)))
+        crypto_amt = est * (1.0 + bps / 10_000.0)
 
-    # Applica slippage (bps) con bound di sicurezza 0..2000 bps (0..20%)
-    bps = int(payload.slippage_bps or 0)
-    bps = max(0, min(2000, bps))
-    crypto_amt *= (1.0 + bps / 10_000.0)
-
-    # Crea payout NOWPayments
     np_resp = nowpayments_create_payout(
         address=order.wallet_address,
         amount=float(crypto_amt),
         currency=currency_code,
+        external_id=f"order_{order.id}"
     )
 
-    # Persist risposta e riferimento
     snippet = json.dumps(np_resp)[:4000]
-    order.notes = (order.notes or "")
-    order.notes = (order.notes + f" | np_payout_resp={snippet}").strip()
+    order.notes = ((order.notes or "") + f" | np_payout_resp={snippet}").strip()
 
     payout_ref = None
-    try:
-        if isinstance(np_resp, dict):
-            if "id" in np_resp and isinstance(np_resp["id"], (str, int)):
-                payout_ref = str(np_resp["id"])
-            elif "withdrawals" in np_resp and isinstance(np_resp["withdrawals"], list) and np_resp["withdrawals"]:
-                wid = np_resp["withdrawals"][0]
-                payout_ref = str(wid.get("id") or wid.get("txid") or "")
-            elif "data" in np_resp and isinstance(np_resp["data"], list) and np_resp["data"]:
-                wid = np_resp["data"][0]
-                payout_ref = str(wid.get("id") or wid.get("txid") or "")
-    except Exception:
-        pass
+    if isinstance(np_resp, dict):
+        if "id" in np_resp:
+            payout_ref = str(np_resp["id"])
+        elif "withdrawals" in np_resp and isinstance(np_resp["withdrawals"], list) and np_resp["withdrawals"]:
+            wid = np_resp["withdrawals"][0]
+            payout_ref = str(wid.get("id") or wid.get("txid") or "")
 
     if payout_ref:
         order.payout_txid = payout_ref
@@ -335,7 +414,6 @@ def trigger_payout(order_id: int, payload: PayoutIn, db: Session = Depends(get_d
         "payout_reference": order.payout_txid,
         "currency": currency_code,
         "amount": float(crypto_amt),
-        "slippage_bps": bps,
     }
 
 
@@ -343,7 +421,7 @@ def trigger_payout(order_id: int, payload: PayoutIn, db: Session = Depends(get_d
 async def nowpayments_webhook(request: Request, x_nowpayments_sig: str = Header(default=""), db: Session = Depends(get_db)):
     raw = await request.body()
 
-    # Idempotency base (dedup)
+    # dedup semplice
     body_hash = hashlib.sha256(raw).hexdigest()
     try:
         evt = WebhookEvent(provider="nowpayments", signature=(x_nowpayments_sig or ""), body_hash=body_hash)
@@ -353,30 +431,50 @@ async def nowpayments_webhook(request: Request, x_nowpayments_sig: str = Header(
         db.rollback()
         return {"ok": True, "note": "duplicate"}
 
-    # Firma
     if not verify_nowpayments_signature(raw, x_nowpayments_sig):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     payload = json.loads(raw.decode("utf-8"))
-    oid = int(payload.get("external_id") or payload.get("order_id", 0))
-    order = db.query(Order).filter(Order.id == oid).one_or_none()
-    if not order:
-        return {"ok": True, "note": "order not found"}
-
     status = payload.get("status")
     txid = payload.get("transaction_id") or payload.get("txid")
+    external_id = payload.get("external_id") or payload.get("order_id") or payload.get("id")
 
-    if status == "finished":
-        order.status = "completed"
-        if txid:
-            order.payout_txid = txid
-    elif status in ("processing", "pending", "confirming"):
-        order.status = "queued"
-    elif status in ("failed", "canceled"):
-        order.status = "failed"
+    # webhook su ordine?
+    oid = None
+    if external_id and str(external_id).startswith("order_"):
+        try:
+            oid = int(str(external_id).split("order_")[1])
+        except Exception:
+            oid = None
 
-    db.commit()
-    return {"ok": True, "order_id": oid, "new_status": order.status, "payout_txid": order.payout_txid}
+    if oid:
+        order = db.query(Order).filter(Order.id == oid).one_or_none()
+        if not order:
+            return {"ok": True, "note": "order not found"}
+        if status == "finished":
+            order.status = "completed"
+            if txid:
+                order.payout_txid = txid
+        elif status in ("processing", "pending", "confirming"):
+            order.status = "queued"
+        elif status in ("failed", "canceled"):
+            order.status = "failed"
+        db.commit()
+        return {"ok": True, "order_id": oid, "new_status": order.status, "payout_txid": order.payout_txid}
+
+    # webhook su listing (external_id == listing_SYMBOL)
+    if external_id and str(external_id).startswith("listing_"):
+        symbol = str(external_id).split("listing_")[1].upper()
+        price = db.query(Price).filter(Price.token_symbol == symbol).one_or_none()
+        if price:
+            if status == "finished":
+                price.auto_payout_done = 1
+                if txid:
+                    price.auto_payout_txid = txid
+                db.commit()
+            return {"ok": True, "token_symbol": symbol, "auto_payout_txid": price.auto_payout_txid, "status": status}
+
+    return {"ok": True, "note": "ignored"}
 
 
 @app.get("/offramp/orders/{order_id}")
@@ -397,6 +495,24 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
         "crypto_network": order.crypto_network,
         "created_at": order.created_at.isoformat(),
         "notes": order.notes,
+    }
+
+
+# (opz) leggi stato listing
+@app.get("/otc/price/{token_symbol}")
+def get_price(token_symbol: str, db: Session = Depends(get_db)):
+    price = db.query(Price).filter(Price.token_symbol == token_symbol.upper()).one_or_none()
+    if not price:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return {
+        "token_symbol": price.token_symbol,
+        "price_eur": price.price_eur,
+        "available_amount": price.available_amount,
+        "updated_at": price.updated_at.isoformat(),
+        "wallet_address": price.wallet_address,
+        "auto_payout_done": price.auto_payout_done,
+        "auto_payout_txid": price.auto_payout_txid,
+        "notes": price.notes,
     }
 
 
